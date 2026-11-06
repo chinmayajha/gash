@@ -1,8 +1,9 @@
 name: Attribution
 
-# Every commit in a PR must say which models helped write it, with a
-# "Co-Authored-By: Claude <Model> <noreply@anthropic.com>" trailer per model, or
-# "AI-Assisted: none" when no model was used. See .github/scripts/check-attribution.sh.
+# Every commit in a PR must say which models helped write it, with an
+# "Assisted-By: <model and version>" or "Co-Authored-By: <model and version> <noreply@vendor>"
+# trailer per model, or "Assisted-By: none" when no model was used.
+# See .github/scripts/check-attribution.sh.
 
 on:
   pull_request:

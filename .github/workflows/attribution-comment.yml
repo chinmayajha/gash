@@ -82,7 +82,12 @@ jobs:
               echo
               cat "$report"
               echo
-              echo "End each commit message with a \`Co-Authored-By: Claude <Model> <version> <noreply@anthropic.com>\` trailer for each model used, for example \`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\`, or with \`AI-Assisted: none\` if no model was used. Reword them with \`git rebase -i\` and force-push the branch."
+              echo "End each commit message with a trailer for each model used, naming the model and its version:"
+              echo
+              echo "- \`Assisted-By: <model and version>\`, for any model, e.g. \`Assisted-By: GPT-5.1\` or \`Assisted-By: Gemini 2.5 Pro\`"
+              echo "- or \`Co-Authored-By: <model and version> <noreply@vendor>\`, the form some tools write, e.g. \`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\`"
+              echo
+              echo "If no model was used, end it with \`Assisted-By: none\`. Reword the commits with \`git rebase -i\` and force-push the branch."
             } > "$body"
           else
             echo "check-attribution.sh failed without reporting a commit (exit $status)."
