@@ -1,3 +1,4 @@
+wc() { command wc "$@" | tr -d ' '; }
 # pipelines carrying data: pipes into blocks/loops/subshells, |&, multi-line pipelines
 echo "abc" | tr a-z A-Z | sed 's/^/c1: /'
 printf 'b\na\nc\n' | sort | head -n 2 | tr '\n' ' ' | sed 's/^/c2: /'; echo

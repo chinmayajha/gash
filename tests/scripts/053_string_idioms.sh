@@ -1,3 +1,4 @@
+wc() { command wc "$@" | tr -d ' '; }
 # common string-manipulation idioms
 s="   hello world   "
 trimmed="${s#"${s%%[![:space:]]*}"}"

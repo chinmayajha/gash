@@ -1245,8 +1245,7 @@ impl Shell {
     fn proc_subst(&mut self, input: bool, prog: &Arc<Program>) -> Result<String, Flow> {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let m = crate::path::mounts();
-        let path = m.temp.join(format!("gash-ps-{}-{}", std::process::id(), n));
+        let path = std::env::temp_dir().join(format!("gash-ps-{}-{}", std::process::id(), n));
         if input {
             let f = match std::fs::File::create(&path) {
                 Ok(f) => f,
@@ -1367,5 +1366,5 @@ pub fn attr_letters(a: u32, v: Option<&Value>) -> String {
 }
 
 pub fn home_dir() -> std::path::PathBuf {
-    std::env::var("USERPROFILE").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("C:\\"))
+    std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("/"))
 }

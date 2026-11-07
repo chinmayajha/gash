@@ -17,11 +17,11 @@ EOF
 # a function, with a command substitution running the program
 f() { x=$(/usr/bin/true); cat; }
 echo "func cmdsub: [$(f <<< data)]"
-g() { /usr/bin/true; /usr/bin/cat; }
+g() { /usr/bin/true; /bin/cat; }
 echo "func msys cat: [$(g <<< data)]"
 
 # the wrapper pattern from the report: resolve a path, then exec the reader
-printf '#!/usr/bin/env bash\np=$(/usr/bin/cygpath -w /)\nexec /usr/bin/cat\n' > launcher
+printf '#!/usr/bin/env bash\np=$(/usr/bin/cygpath -w /)\nexec /bin/cat\n' > launcher
 chmod +x launcher
 ./launcher <<'EOF'
 echo remote script
@@ -29,7 +29,7 @@ exit 0
 EOF
 
 # readers that take part of the input leave the rest
-{ read -r a; /usr/bin/true; read -r b; /usr/bin/cat; } <<EOF
+{ read -r a; /usr/bin/true; read -r b; /bin/cat; } <<EOF
 1
 2
 3
@@ -69,6 +69,6 @@ f <<< "$big" | /usr/bin/wc -c
 
 # each command gets its own copy
 for i in 1 2; do /usr/bin/true; cat; done <<< once
-cat <<< again; /usr/bin/cat <<< again
+cat <<< again; /bin/cat <<< again
 
 cd / && rm -rf "$d"

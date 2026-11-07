@@ -231,13 +231,12 @@ impl Job {
         self.status = Some(st);
         st
     }
-    /// Stop the job with signal `sig`. Windows has no signals: its process is terminated with exit
-    /// code 128+sig, which `wait` then reports, as bash does for a job killed by a signal.
+    /// Stop the job with signal `sig`.
     pub fn kill(&mut self, sig: i32) {
-        let code = 128 + sig as u32;
+        let sig = sig as u32;
         match &mut self.kind {
             JobKind::Proc(c) => {
-                if !crate::sys::kill_pid(c.id(), code) {
+                if !crate::sys::kill_pid(c.id(), sig) {
                     let _ = c.kill();
                 }
             }
@@ -245,7 +244,7 @@ impl Job {
                 self.cancel.store(true, Ordering::SeqCst);
                 let p = self.child_pid.load(Ordering::SeqCst);
                 if p != 0 {
-                    crate::sys::kill_pid(p, code);
+                    crate::sys::kill_pid(p, sig);
                 }
             }
         }
@@ -267,17 +266,12 @@ pub struct Frame {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExeKind {
-    /// Native Windows program (needs MSYS-style argument conversion).
+    /// A program the OS executes.
     Native,
-    /// MSYS2 program (understands POSIX paths).
-    Msys,
-    Batch,
     /// Shell script to run in-process.
     Script,
     /// Script with a foreign interpreter (resolved interpreter path + optional arg).
     Interp,
-    /// A utility of Microsoft Coreutils for Windows standing in for an MSYS tool.
-    Coreutils,
 }
 
 #[derive(Clone, Debug)]
@@ -285,8 +279,6 @@ pub struct Resolved {
     pub path: PathBuf,
     pub kind: ExeKind,
     pub interp: Option<(PathBuf, ExeKind, Option<String>)>,
-    /// For ExeKind::Coreutils: the utility name.
-    pub util: Option<&'static str>,
     /// For ExeKind::Script: the options on its `#!` line, as bash would be given them.
     pub opts: Vec<String>,
 }
@@ -1091,15 +1083,12 @@ impl Shell {
     /// an installation share one mount table, so the first to start decides `/tmp` for the rest.
     /// MSYS turns TMP/TEMP back into POSIX form at startup, so the program still sees `/tmp`.
     /// A child gash also reads TEMP to find the folder behind `/tmp`.
-    pub fn child_env(&mut self, extra: &[(String, String)], native: bool) -> Vec<(String, String)> {
+    pub fn child_env(&mut self, extra: &[(String, String)]) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        let cwd = self.cwd.clone();
-        let convert = |k: &str| native || matches!(k, "PATH" | "TMP" | "TEMP");
         for (k, v) in extra {
             seen.insert(k.to_uppercase());
-            let val = if convert(k) { crate::path::convert_env_value(k, v, &cwd) } else { v.clone() };
-            out.push((k.clone(), val));
+            out.push((k.clone(), v.clone()));
         }
         let names = self.vars.names();
         for name in names {
@@ -1118,7 +1107,6 @@ impl Shell {
                 _ => continue,
             };
             seen.insert(name.to_uppercase());
-            let val = if convert(&name) { crate::path::convert_env_value(&name, &val, &cwd) } else { val };
             out.push((name, val));
         }
         for (k, v) in self.env_extra.iter() {

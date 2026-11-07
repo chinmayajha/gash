@@ -37,4 +37,4 @@ shopt -u xpg_echo
 echo "c32: xpg \t off"
 echo c33: a\ b\ \ c
 echo "c34: $(echo -n inner)|"
-echo c35: '' empty-arg ''|cat -A
+echo c35: '' empty-arg ''|cat -vet

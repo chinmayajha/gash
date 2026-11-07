@@ -5,26 +5,24 @@ use crate::sys;
 use std::fs::File;
 use std::io::{self, BufRead, PipeReader, PipeWriter, Read, Seek, SeekFrom, Write};
 use std::mem::ManuallyDrop;
-use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle};
+use std::os::unix::io::{AsFd, FromRawFd};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 /// Here-document and here-string input. It starts in memory so builtins can read it
 /// cheaply. The first time it's handed to a child process, the unread part moves to a
-/// pipe or file that the shell and every later child share, as bash does: a child that
+/// temporary file that the shell and every later child share, as bash does: a child that
 /// reads only part of it, or none, leaves the rest for the next reader.
 #[derive(Debug, Default)]
 pub struct MemReader {
     data: Vec<u8>,
     pos: usize,
-    /// Where the input went once a child needed it: `Handle::PipeR` or `Handle::File`.
+    /// Where the input went once a child needed it: `Handle::File`.
     shared: Option<Handle>,
 }
 
-/// Input up to this size goes in a pipe that holds all of it, and larger input in a
-/// temporary file. Like bash 5.1+ (and Git Bash): a program that reads part of its
-/// input can seek back over the excess in a file, but not in a pipe.
+/// Input larger than this is written to a file instead of being pumped through a pipe.
 const HEREDOC_PIPE_MAX: usize = 64 * 1024;
 
 impl MemReader {
@@ -32,35 +30,25 @@ impl MemReader {
         MemReader { data, pos: 0, shared: None }
     }
 
-    /// The pipe or file holding the unread input, creating it on first use.
+    /// The file holding the unread input, creating it on first use.
     fn shared(&mut self) -> io::Result<Handle> {
         if let Some(h) = &self.shared {
             return Ok(h.clone());
         }
-        let rest = &self.data[self.pos..];
-        let h = if rest.len() <= HEREDOC_PIPE_MAX {
-            // The pipe's buffer holds all of it, so this write doesn't wait for a reader.
-            let (r, mut w) = sys::pipe_with_size(HEREDOC_PIPE_MAX as u32)?;
-            w.write_all(rest)?;
-            Handle::PipeR(Arc::new(r))
-        } else {
-            // All of it, positioned after what builtins already read: a program that
-            // reopens the file by name (/dev/stdin) reads from the start, as with bash.
-            let mut f = temp_file()?;
-            f.write_all(&self.data)?;
-            f.seek(SeekFrom::Start(self.pos as u64))?;
-            Handle::File(Arc::new(f))
-        };
+        // All of it, positioned after what builtins already read: a program that
+        // reopens the file by name (/dev/stdin) reads from the start, as with bash.
+        let mut f = temp_file()?;
+        f.write_all(&self.data)?;
+        f.seek(SeekFrom::Start(self.pos as u64))?;
+        let h = Handle::File(Arc::new(f));
         self.data = Vec::new();
         self.pos = 0;
         self.shared = Some(h.clone());
         Ok(h)
     }
 
-    /// The unread input as a file, for an MSYS child whose arguments name it
-    /// (`/dev/stdin`, `/dev/fd/0`, `/proc/self/fd/0`). MSYS can reopen those only when
-    /// they are a file (or a pipe it made itself; ours shows up as `pipe:[0]` and fails
-    /// with "No such file or directory").
+    /// The unread input as a file, for a child whose arguments name it
+    /// (`/dev/stdin`, `/dev/fd/0`, `/proc/self/fd/0`).
     ///
     /// Returns `None` when the input is already in a file, which the child then shares
     /// as usual. Otherwise the input moves to a new file for the duration of the child,
@@ -69,17 +57,12 @@ impl MemReader {
         let rest = match &self.shared {
             Some(Handle::File(_)) => return Ok(None),
             Some(h) => {
-                // The pipe's write end is closed, so this stops at the end of the input.
                 let mut v = Vec::new();
                 let mut buf = [0u8; 8192];
                 while let Ok(n @ 1..) = h.read(&mut buf) {
                     v.extend_from_slice(&buf[..n]);
                 }
                 v
-            }
-            None if self.data.len() > HEREDOC_PIPE_MAX => {
-                self.shared()?;
-                return Ok(None);
             }
             None => self.data.split_off(self.pos),
         };
@@ -120,13 +103,10 @@ impl MemReader {
     }
 }
 
-/// A new temporary file that Windows deletes once the last handle to it, ours or a
-/// child's, is closed.
+/// A new temporary file that disappears from the directory at once; it lives as long as
+/// any process holds a descriptor to it.
 fn temp_file() -> io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
-    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
-    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let dir = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
@@ -141,16 +121,11 @@ fn temp_file() -> io::Result<File> {
             SEQ.fetch_add(1, Ordering::Relaxed),
             nanos
         );
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .share_mode(0x7) // read | write | delete
-            .attributes(FILE_ATTRIBUTE_TEMPORARY)
-            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-            .open(dir.join(name))
-        {
-            Ok(f) => return Ok(f),
+        match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(dir.join(&name)) {
+            Ok(f) => {
+                let _ = std::fs::remove_file(dir.join(&name));
+                return Ok(f);
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
             Err(e) => return Err(e),
         }
@@ -164,11 +139,8 @@ pub enum Handle {
     Stdout,
     Stderr,
     File(Arc<File>),
-    /// A file opened with `>>`. It has ordinary write access, because MSYS programs take an
-    /// inherited handle as writable only when it has FILE_WRITE_DATA, so it can't be an
-    /// append-only handle. Instead, like Cygwin's O_APPEND, it moves to the end of the file
-    /// before each write we make and before handing it to a child. Children share its
-    /// position, so they and the shell write one after another rather than over each other.
+    /// A file opened with `>>`. Its descriptor carries `O_APPEND`, so every write, ours
+    /// or a child's, goes to the end of the file atomically.
     Append(Arc<File>),
     PipeR(Arc<PipeReader>),
     PipeW(Arc<PipeWriter>),
@@ -195,39 +167,19 @@ impl std::fmt::Debug for Handle {
 }
 
 fn raw_std(n: sys::DWORD) -> ManuallyDrop<File> {
-    unsafe { ManuallyDrop::new(File::from_raw_handle(sys::std_handle(n) as _)) }
+    unsafe { ManuallyDrop::new(File::from_raw_fd(sys::std_handle(n))) }
 }
 
 pub fn console_stdin() -> bool {
     sys::is_console(sys::STD_INPUT_HANDLE)
 }
 
-/// Write bytes to the process stdout/stderr. Console output goes through Rust's std which
-/// converts UTF-8 to UTF-16; invalid UTF-8 is written lossily.
+/// Write bytes to the process stdout/stderr, unbuffered so output is ordered with what
+/// children write to the same descriptor.
 fn write_std(err: bool, data: &[u8]) -> io::Result<()> {
     sys::seek_std_append(if err { sys::STD_ERROR_HANDLE } else { sys::STD_OUTPUT_HANDLE });
-    let r = if err {
-        let mut e = io::stderr().lock();
-        e.write_all(data).and_then(|_| e.flush())
-    } else {
-        let mut o = io::stdout().lock();
-        o.write_all(data).and_then(|_| o.flush())
-    };
-    match r {
-        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-            let s = String::from_utf8_lossy(data).into_owned();
-            if err {
-                let mut e = io::stderr().lock();
-                e.write_all(s.as_bytes())?;
-                e.flush()
-            } else {
-                let mut o = io::stdout().lock();
-                o.write_all(s.as_bytes())?;
-                o.flush()
-            }
-        }
-        r => r,
-    }
+    let f = raw_std(if err { sys::STD_ERROR_HANDLE } else { sys::STD_OUTPUT_HANDLE });
+    (&*f).write_all(data)
 }
 
 impl Handle {
@@ -236,20 +188,7 @@ impl Handle {
             Handle::Stdout => write_std(false, data),
             Handle::Stderr => write_std(true, data),
             Handle::File(f) => (&**f).write_all(data),
-            Handle::Append(f) => {
-                // Each write is one append at the current end (sys::write_at_end), which also
-                // leaves the shared position there. Seeking to the end and then writing could
-                // land at a stale end when another writer appended in between, and overwrite it.
-                let mut rest = data;
-                while !rest.is_empty() {
-                    let n = sys::write_at_end(f.as_raw_handle() as sys::HANDLE, rest)?;
-                    if n == 0 {
-                        return Err(io::ErrorKind::WriteZero.into());
-                    }
-                    rest = &rest[n..];
-                }
-                Ok(())
-            }
+            Handle::Append(f) => (&**f).write_all(data),
             Handle::PipeW(p) => (&**p).write_all(data),
             Handle::Buf(b) => {
                 b.lock().unwrap().extend_from_slice(data);
@@ -277,16 +216,11 @@ impl Handle {
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
+            // Unbuffered: a buffered stdin would read past what this call was asked for
+            // and swallow input meant for a child or the next command.
             Handle::Stdin => {
-                if console_stdin() {
-                    io::stdin().lock().read(buf)
-                } else {
-                    let f = raw_std(sys::STD_INPUT_HANDLE);
-                    match (&*f).read(buf) {
-                        Err(e) if e.raw_os_error() == Some(109) => Ok(0),
-                        r => r,
-                    }
-                }
+                let f = raw_std(sys::STD_INPUT_HANDLE);
+                (&*f).read(buf)
             }
             Handle::File(f) => (&**f).read(buf),
             Handle::PipeR(p) => match (&**p).read(buf) {
@@ -397,7 +331,7 @@ impl Handle {
                 if fd == 0 {
                     (Stdio::inherit(), None)
                 } else {
-                    (dup_std(io::stdin().as_handle())?, None)
+                    (dup_std(io::stdin().as_fd())?, None)
                 }
             }
             Handle::Stdout => {
@@ -405,7 +339,7 @@ impl Handle {
                 if fd == 1 {
                     (Stdio::inherit(), None)
                 } else {
-                    (dup_std(io::stdout().as_handle())?, None)
+                    (dup_std(io::stdout().as_fd())?, None)
                 }
             }
             Handle::Stderr => {
@@ -413,24 +347,12 @@ impl Handle {
                 if fd == 2 {
                     (Stdio::inherit(), None)
                 } else {
-                    (dup_std(io::stderr().as_handle())?, None)
+                    (dup_std(io::stderr().as_fd())?, None)
                 }
             }
             Handle::File(f) => (Stdio::from(f.try_clone()?), None),
-            Handle::Append(f) => {
-                // Writes through this handle leave its position at the end (see `write_all`), so it
-                // needs moving only when another handle to the file has appended since. Seeking
-                // every time could move it back over output that a program still writing through
-                // it adds meanwhile. The length is read first: writers on this handle only move
-                // the position forward, so they can't make it look behind.
-                let mut g = &**f;
-                if let (Ok(len), Ok(pos)) = (f.metadata().map(|m| m.len()), g.stream_position()) {
-                    if pos < len {
-                        let _ = g.seek(SeekFrom::End(0));
-                    }
-                }
-                (Stdio::from(f.try_clone()?), None)
-            }
+            // The descriptor carries O_APPEND, so the child's writes append atomically too.
+            Handle::Append(f) => (Stdio::from(f.try_clone()?), None),
             Handle::PipeR(p) => (Stdio::from(p.try_clone()?), None),
             Handle::PipeW(p) => (Stdio::from(p.try_clone()?), None),
             Handle::Null => (Stdio::null(), None),
@@ -470,7 +392,7 @@ impl Handle {
     }
 }
 
-fn dup_std(h: std::os::windows::io::BorrowedHandle<'_>) -> io::Result<Stdio> {
+fn dup_std(h: std::os::unix::io::BorrowedFd<'_>) -> io::Result<Stdio> {
     match h.try_clone_to_owned() {
         Ok(o) => Ok(Stdio::from(o)),
         Err(_) => Ok(Stdio::null()),
@@ -537,58 +459,14 @@ impl Fds {
     }
 }
 
-/// A file open for `>>`, shared by every redirection to it in this process (see
-/// `shared_append`).
-struct AppendFile {
-    file: Arc<File>,
-    /// Programs it was handed to. It stays shared while they run, even after the redirection
-    /// that started them is gone (`cmd >> log &`). Process handles rather than ids: Windows
-    /// reuses an id once its process is gone, and an unrelated process with it would keep the
-    /// file open.
-    children: Vec<std::os::windows::io::OwnedHandle>,
-}
-
-static APPEND_FILES: Mutex<Vec<AppendFile>> = Mutex::new(Vec::new());
-
-/// The handle for a file just opened with `>>`. If another `>>` redirection in this process,
-/// or a program started with one, still has the same file open, this shares that handle, and
-/// so its file object and position, instead of adding a second one. Programs appending to the
-/// file through separate redirections at the same time (`cmd >> log &` in a loop) then write
-/// one after another, as with Cygwin's O_APPEND, rather than at the same offset and over each
-/// other.
+/// A file just opened with `>>`. Its descriptor carries `O_APPEND`, so the kernel puts
+/// every write at the current end and separate writers cannot land on the same offset.
 pub fn shared_append(f: File) -> Arc<File> {
-    let mut open = APPEND_FILES.lock().unwrap();
-    prune_append(&mut open);
-    let h = f.as_raw_handle() as sys::HANDLE;
-    if let Some(a) = open.iter().find(|a| sys::same_file(a.file.as_raw_handle() as sys::HANDLE, h)) {
-        return a.file.clone();
-    }
-    let file = Arc::new(f);
-    open.push(AppendFile { file: file.clone(), children: Vec::new() });
-    file
+    Arc::new(f)
 }
 
-/// Record that `child` was started with these `>>` handles.
-pub fn append_started(files: &[Arc<File>], child: &std::process::Child) {
-    let mut open = APPEND_FILES.lock().unwrap();
-    for a in open.iter_mut().filter(|a| files.iter().any(|f| Arc::ptr_eq(f, &a.file))) {
-        if let Ok(h) = child.as_handle().try_clone_to_owned() {
-            a.children.push(h);
-        }
-    }
-}
+/// No bookkeeping needed on Unix: `O_APPEND` is shared with every child through the
+/// descriptor itself.
+pub fn append_started(_files: &[Arc<File>], _child: &std::process::Child) {}
 
-/// Forget the `>>` files that no redirection holds and no program started with them still
-/// writes to, closing them. Called when redirections are undone.
-pub fn prune_append_files() {
-    if let Ok(mut open) = APPEND_FILES.try_lock() {
-        prune_append(&mut open);
-    }
-}
-
-fn prune_append(open: &mut Vec<AppendFile>) {
-    open.retain_mut(|a| {
-        a.children.retain(|h| sys::process_running(h.as_raw_handle() as sys::HANDLE));
-        Arc::strong_count(&a.file) > 1 || !a.children.is_empty()
-    });
-}
+pub fn prune_append_files() {}

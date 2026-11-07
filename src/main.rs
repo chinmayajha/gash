@@ -5,7 +5,6 @@ mod arith;
 mod ast;
 mod builtins;
 mod builtins_io;
-mod coreutils;
 mod exec;
 mod expand;
 mod interactive;
@@ -231,7 +230,7 @@ fn import_environment(sh: &mut Shell) {
     for (k, v) in std::env::vars_os() {
         let k = k.to_string_lossy().into_owned();
         let v = v.to_string_lossy().into_owned();
-        if k.is_empty() {
+        if k.is_empty() || k == "_" {
             continue;
         }
         let k = if k.eq_ignore_ascii_case("PATH") { "PATH".to_string() } else { k };
@@ -239,7 +238,6 @@ fn import_environment(sh: &mut Shell) {
             extra.push((k, v));
             continue;
         }
-        let v = if k == "PATH" && (v.contains(';') || path::is_windows_abs(&v)) { path::win_list_to_posix(&v) } else { v };
         let var = sh.vars.global_mut(&k);
         var.value = Some(Value::Str(v));
         var.attrs |= EXPORT;
@@ -256,77 +254,29 @@ fn setv(sh: &mut Shell, k: &str, v: &str, export: bool) {
 }
 
 fn setup_environment(sh: &mut Shell, login: bool) {
-    let m = path::mounts();
     // HOME
     let home = match sh.get_str("HOME") {
-        Some(h) if !h.is_empty() => {
-            if path::is_windows_abs(&h) {
-                path::to_posix(std::path::Path::new(&h))
-            } else {
-                h
-            }
-        }
+        Some(h) if !h.is_empty() => h,
         _ => path::to_posix(&expand::home_dir()),
     };
     setv(sh, "HOME", &home, true);
-    // MSYSTEM
-    let msystem = match sh.get_str("MSYSTEM") {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            if m.root.join("ucrt64").join("bin").is_dir() {
-                "UCRT64".into()
-            } else if m.root.join("mingw64").join("bin").is_dir() {
-                "MINGW64".into()
-            } else if m.root.join("clangarm64").join("bin").is_dir() {
-                "CLANGARM64".into()
-            } else {
-                "MINGW64".into()
-            }
-        }
-    };
-    let prefix = format!("/{}", msystem.to_lowercase());
-    setv(sh, "MSYSTEM", &msystem, true);
-    if sh.get_str("MSYSTEM_PREFIX").is_none() {
-        setv(sh, "MSYSTEM_PREFIX", &prefix, true);
-        setv(sh, "MINGW_PREFIX", &prefix, true);
-        setv(sh, "MSYSTEM_CARCH", "x86_64", true);
-        setv(sh, "MSYSTEM_CHOST", "x86_64-w64-mingw32", true);
-        setv(sh, "MINGW_CHOST", "x86_64-w64-mingw32", true);
-        let pkg = match msystem.as_str() {
-            "UCRT64" => "mingw-w64-ucrt-x86_64",
-            "CLANGARM64" => "mingw-w64-clang-aarch64",
-            _ => "mingw-w64-x86_64",
-        };
-        setv(sh, "MINGW_PACKAGE_PREFIX", pkg, true);
-    }
-    // PATH: make sure the MSYS tool directories are present (like Git Bash's launcher + /etc/profile).
+    // PATH: keep what we inherited; a login shell also gets the usual system directories.
     let cur = sh.get_str("PATH").unwrap_or_default();
-    if sh.get_str("ORIGINAL_PATH").is_none() {
-        setv(sh, "ORIGINAL_PATH", &cur, true);
-    }
     let mut parts = path::split_posix_list(&cur);
     let mut front: Vec<String> = Vec::new();
-    let want = if login { vec![format!("{}/bin", home), format!("{}/bin", prefix), "/usr/local/bin".to_string(), "/usr/bin".to_string(), "/bin".to_string()] } else { vec![format!("{}/bin", prefix), "/usr/bin".to_string()] };
-    for w in want {
-        let present = parts.iter().any(|p| p == &w || (w == "/bin" && p == "/usr/bin" && false));
-        if !present {
-            if w == "/bin" && parts.iter().chain(front.iter()).any(|p| p == "/usr/bin") {
-                continue;
+    if login {
+        for w in ["/usr/local/bin", "/usr/bin", "/bin"] {
+            if !parts.iter().any(|p| p == w) {
+                front.push(w.to_string());
             }
-            if w == "/usr/local/bin" && !m.root.join("usr").join("local").join("bin").is_dir() {
-                continue;
-            }
-            front.push(w);
         }
     }
     front.append(&mut parts);
-    // If gash is installed as bash/sh (bash.exe or sh.exe beside gash.exe), make that folder
-    // win over Git's /usr/bin, so `bash`, `sh` and child processes that run them get gash —
-    // just as Git Bash puts its own bash first. ~/bin and anything earlier still take precedence.
+    // If gash is installed as bash/sh beside a copy of itself, put that folder first so
+    // `bash`, `sh` and children that run them get gash. ~/bin and anything earlier still win.
     if let Some(own) = own_shell_dir() {
-        front.retain(|p| !p.eq_ignore_ascii_case(&own));
-        let at = front.iter().position(|p| p == "/usr/bin" || p == "/bin").unwrap_or(0);
-        front.insert(at, own);
+        front.retain(|p| p != &own);
+        front.insert(0, own);
     }
     setv(sh, "PATH", &front.join(":"), true);
     // misc
@@ -348,22 +298,9 @@ fn setup_environment(sh: &mut Shell, login: bool) {
     if login && sh.get_str("LANG").is_none() && sh.get_str("LC_ALL").is_none() && sh.get_str("LC_CTYPE").is_none() {
         setv(sh, "LANG", "en_US.UTF-8", true);
     }
-    for t in ["TMP", "TEMP"] {
-        let cur = sh.get_str(t).unwrap_or_default();
-        if !cur.is_empty() {
-            let orig = format!("ORIGINAL_{}", t);
-            if sh.get_str(&orig).is_none() {
-                setv(sh, &orig, &cur, true);
-            }
-        }
-        setv(sh, t, "/tmp", true);
-    }
     if sh.get_str("HOSTNAME").is_none() {
         let h = sys::host_name();
         setv(sh, "HOSTNAME", &h, false);
-    }
-    if sh.get_str("TITLEPREFIX").is_none() {
-        setv(sh, "TITLEPREFIX", &msystem, false);
     }
     if sh.get_str("CONFIG_SITE").is_none() && login {
         setv(sh, "CONFIG_SITE", "/etc/config.site", true);
@@ -387,14 +324,14 @@ fn setup_environment(sh: &mut Shell, login: bool) {
     }
 }
 
-/// MSYS-form folder of our executable, if it also provides `bash.exe` or `sh.exe`
-/// (or we are ourselves running as bash/sh).
+/// Folder of our executable, if it also provides `bash` or `sh` (or we are ourselves
+/// running as bash/sh).
 fn own_shell_dir() -> Option<String> {
     let exe = &global().exe;
     let dir = exe.parent()?;
     let stem = exe.file_stem()?.to_string_lossy().to_ascii_lowercase();
-    let provides = stem == "bash" || stem == "sh" || dir.join("bash.exe").is_file() || dir.join("sh.exe").is_file();
-    if !provides || path::is_msys_binary(exe) {
+    let provides = stem == "bash" || stem == "sh" || dir.join("bash").is_file() || dir.join("sh").is_file();
+    if !provides {
         return None;
     }
     Some(path::to_posix(dir))
@@ -420,9 +357,8 @@ fn source_if_exists(sh: &mut Shell, posix: &str) -> Option<R> {
 fn real_main(argv: Vec<String>) -> i32 {
     path::init();
     let argv0 = argv.first().cloned().unwrap_or_else(|| "gash".into());
-    let base = argv0.rsplit(['/', '\\']).next().unwrap_or("gash").trim_start_matches('-');
-    let base = base.strip_suffix(".exe").or_else(|| base.strip_suffix(".EXE")).unwrap_or(base).to_string();
-    let name = if base.is_empty() { "gash".to_string() } else { base };
+    let base = argv0.rsplit('/').next().unwrap_or("gash").trim_start_matches('-');
+    let name = if base.is_empty() { "gash".to_string() } else { base.to_string() };
     let cli = match parse_cli(&argv, &name, true) {
         Ok(c) => c,
         Err(code) => return code,

@@ -530,20 +530,22 @@ pub fn printf(sh: &mut Shell, args: &[String]) -> R {
 
 #[repr(C)]
 #[derive(Default)]
-#[allow(non_snake_case)]
-struct TimeZoneInfo {
-    Bias: i32,
-    StandardName: [u16; 32],
-    StandardDate: [u16; 8],
-    StandardBias: i32,
-    DaylightName: [u16; 32],
-    DaylightDate: [u16; 8],
-    DaylightBias: i32,
+struct Tm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+    tm_gmtoff: i64,
+    tm_zone: *const core::ffi::c_char,
 }
 
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetTimeZoneInformation(tz: *mut TimeZoneInfo) -> u32;
+extern "C" {
+    fn localtime_r(t: *const i64, tm: *mut Tm) -> *mut Tm;
 }
 
 pub fn now_epoch() -> i64 {
@@ -552,17 +554,17 @@ pub fn now_epoch() -> i64 {
 
 /// Local offset from UTC in seconds, and zone name.
 pub fn tz_offset() -> (i64, String) {
-    let mut tz = TimeZoneInfo::default();
-    let r = unsafe { GetTimeZoneInformation(&mut tz) };
-    let (bias, name) = if r == 2 {
-        (tz.Bias + tz.DaylightBias, &tz.DaylightName)
+    let now = now_epoch();
+    let mut tm = Tm::default();
+    if unsafe { localtime_r(&now, &mut tm) }.is_null() {
+        return (0, "UTC".into());
+    }
+    let name = if tm.tm_zone.is_null() {
+        String::new()
     } else {
-        (tz.Bias + tz.StandardBias, &tz.StandardName)
+        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }.to_string_lossy().into_owned()
     };
-    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-    let n = String::from_utf16_lossy(&name[..end]);
-    let abbr: String = n.split_whitespace().filter_map(|w| w.chars().next()).collect();
-    (-(bias as i64) * 60, if abbr.is_empty() { "UTC".into() } else { abbr })
+    (tm.tm_gmtoff, if name.is_empty() { "UTC".into() } else { name })
 }
 
 fn civil(days: i64) -> (i64, u32, u32) {
@@ -942,24 +944,22 @@ pub fn read(sh: &mut Shell, args: &[String]) -> R {
 }
 
 struct EchoOff {
-    mode: u32,
+    saved: Option<crate::sys::Termios>,
 }
 impl EchoOff {
     fn new() -> EchoOff {
-        let h = crate::sys::std_handle(crate::sys::STD_INPUT_HANDLE);
-        let mut m = 0;
-        unsafe {
-            crate::sys::GetConsoleMode(h, &mut m);
-            crate::sys::SetConsoleMode(h, m & !0x4);
+        let saved = crate::sys::get_termios(0);
+        if let Some(mut t) = saved {
+            crate::sys::no_echo_termios(&mut t);
+            crate::sys::set_termios(0, &t);
         }
-        EchoOff { mode: m }
+        EchoOff { saved }
     }
 }
 impl Drop for EchoOff {
     fn drop(&mut self) {
-        let h = crate::sys::std_handle(crate::sys::STD_INPUT_HANDLE);
-        unsafe {
-            crate::sys::SetConsoleMode(h, self.mode);
+        if let Some(t) = &self.saved {
+            crate::sys::set_termios(0, t);
         }
     }
 }

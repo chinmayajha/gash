@@ -1,3 +1,4 @@
+wc() { command wc "$@" | tr -d ' '; }
 # command substitution, part 2: functions, word splitting of results, process substitution, backtick escapes
 x=hello
 f() { echo "func out"; }

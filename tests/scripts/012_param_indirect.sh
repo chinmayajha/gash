@@ -27,7 +27,7 @@ echo "c13: ${num@a} ${a@a} ${t@a}"
 declare -A h=([k]=v)
 echo "c14: ${h@a}"
 esc='a\tb'
-echo "c15: ${esc@E}" | cat -A
+echo "c15: ${esc@E}" | cat -vet
 echo "c16: ${t@A}"
 echo "c17: ${num@A}"
 declare -n nr=target

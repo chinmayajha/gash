@@ -38,6 +38,17 @@ const MAX_LINE_CHARS: usize = 200;
 /// Above this many lines on either side, fall back to a positional diff.
 const MAX_LCS_LINES: usize = 3000;
 
+/// Scripts that encode Git-for-Windows/MSYS behavior (path translation, `.exe`
+/// lookup, pipes that MSYS cannot reopen). They don't apply to a Unix shell.
+#[cfg(not(windows))]
+const WINDOWS_ONLY: &[&str] = &[
+    "063_heredoc_shared_stdin",
+    "064_dev_stdin",
+    "067_double_slash_switches",
+    "068_exe_suffix_file_tests",
+    "072_pathconv_env_pwd_w",
+];
+
 const REMOVED_ENV: &[&str] = &[
     "LANG",
     "BASH_ENV",
@@ -76,6 +87,7 @@ fn compat() {
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|name| name.ends_with(".sh") && name.contains(filter.as_str()))
+        .filter(|name| cfg!(windows) || !WINDOWS_ONLY.iter().any(|w| name.starts_with(w)))
         .collect();
     scripts.sort();
     assert!(

@@ -1,483 +1,365 @@
-//! Minimal Win32 FFI (no external crates).
-#![allow(non_snake_case, clippy::upper_case_acronyms)]
+//! Minimal POSIX FFI (no external crates): terminals, signals, processes, CPU time.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub type HANDLE = *mut core::ffi::c_void;
-pub type BOOL = i32;
+/// A file descriptor. The shell's handle table is keyed by the same numbers.
+pub type HANDLE = i32;
 pub type DWORD = u32;
 
-pub const STD_INPUT_HANDLE: DWORD = -10i32 as DWORD;
-pub const STD_OUTPUT_HANDLE: DWORD = -11i32 as DWORD;
-pub const STD_ERROR_HANDLE: DWORD = -12i32 as DWORD;
+pub const STD_INPUT_HANDLE: DWORD = 0;
+pub const STD_OUTPUT_HANDLE: DWORD = 1;
+pub const STD_ERROR_HANDLE: DWORD = 2;
 pub const FILE_TYPE_DISK: DWORD = 1;
-pub const FILE_TYPE_CHAR: DWORD = 2;
-pub const FILE_TYPE_PIPE: DWORD = 3;
-pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
-pub const ENABLE_PROCESSED_OUTPUT: DWORD = 0x0001;
-pub const PROCESS_TERMINATE: DWORD = 0x0001;
-pub const SYNCHRONIZE: DWORD = 0x0010_0000;
-pub const WAIT_OBJECT_0: DWORD = 0;
-pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const FILE_TYPE_CHAR: DWORD = 2;
+const FILE_TYPE_PIPE: DWORD = 3;
+
+type CInt = i32;
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
-pub struct COORD {
-    pub X: i16,
-    pub Y: i16,
-}
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-pub struct SMALL_RECT {
-    pub Left: i16,
-    pub Top: i16,
-    pub Right: i16,
-    pub Bottom: i16,
-}
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-pub struct CONSOLE_SCREEN_BUFFER_INFO {
-    pub dwSize: COORD,
-    pub dwCursorPosition: COORD,
-    pub wAttributes: u16,
-    pub srWindow: SMALL_RECT,
-    pub dwMaximumWindowSize: COORD,
-}
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-pub struct FILETIME {
-    pub lo: u32,
-    pub hi: u32,
+#[derive(Clone, Copy, Default)]
+pub struct Termios {
+    c_iflag: u64,
+    c_oflag: u64,
+    c_cflag: u64,
+    c_lflag: u64,
+    c_cc: [u8; 20],
+    c_ispeed: u64,
+    c_ospeed: u64,
 }
 
-#[link(name = "kernel32")]
-extern "system" {
-    pub fn GetStdHandle(n: DWORD) -> HANDLE;
-    pub fn GetConsoleMode(h: HANDLE, mode: *mut DWORD) -> BOOL;
-    pub fn SetConsoleMode(h: HANDLE, mode: DWORD) -> BOOL;
-    pub fn GetFileType(h: HANDLE) -> DWORD;
-    pub fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(DWORD) -> BOOL>, add: BOOL) -> BOOL;
-    pub fn GetConsoleScreenBufferInfo(h: HANDLE, info: *mut CONSOLE_SCREEN_BUFFER_INFO) -> BOOL;
-    pub fn GetConsoleOutputCP() -> u32;
-    pub fn SetConsoleOutputCP(cp: u32) -> BOOL;
-    pub fn GetConsoleCP() -> u32;
-    pub fn SetConsoleCP(cp: u32) -> BOOL;
-    pub fn OpenProcess(access: DWORD, inherit: BOOL, pid: DWORD) -> HANDLE;
-    pub fn TerminateProcess(h: HANDLE, code: u32) -> BOOL;
-    pub fn CloseHandle(h: HANDLE) -> BOOL;
-    pub fn WaitForSingleObject(h: HANDLE, ms: DWORD) -> DWORD;
-    pub fn GetProcessTimes(h: HANDLE, c: *mut FILETIME, e: *mut FILETIME, k: *mut FILETIME, u: *mut FILETIME) -> BOOL;
-    pub fn GetCurrentProcess() -> HANDLE;
-    pub fn FlushConsoleInputBuffer(h: HANDLE) -> BOOL;
-    pub fn GetConsoleWindow() -> HANDLE;
-    pub fn SetConsoleTitleW(title: *const u16) -> BOOL;
-    pub fn GetLastError() -> DWORD;
-    pub fn ReOpenFile(h: HANDLE, access: DWORD, share: DWORD, flags: DWORD) -> HANDLE;
-    pub fn SetStdHandle(n: DWORD, h: HANDLE) -> BOOL;
-    pub fn SetFilePointerEx(h: HANDLE, dist: i64, new_pos: *mut i64, method: DWORD) -> BOOL;
-    pub fn GetFileInformationByHandle(h: HANDLE, info: *mut BY_HANDLE_FILE_INFORMATION) -> BOOL;
-    fn CreatePipe(read: *mut HANDLE, write: *mut HANDLE, sa: *mut core::ffi::c_void, size: DWORD) -> BOOL;
-}
-
-/// An anonymous pipe whose buffer holds at least `size` bytes, so that much can be
-/// written to it without a reader.
-pub fn pipe_with_size(size: DWORD) -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
-    use std::os::windows::io::FromRawHandle;
-    let mut r: HANDLE = std::ptr::null_mut();
-    let mut w: HANDLE = std::ptr::null_mut();
-    if unsafe { CreatePipe(&mut r, &mut w, std::ptr::null_mut(), size) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    unsafe { Ok((std::io::PipeReader::from_raw_handle(r as _), std::io::PipeWriter::from_raw_handle(w as _))) }
-}
+// c_lflag / c_iflag bits (macOS sys/termios.h).
+const ISIG: u64 = 0x0000_0080;
+const ICANON: u64 = 0x0000_0100;
+const ECHO: u64 = 0x0000_0008;
+const IEXTEN: u64 = 0x0000_0400;
+const IXON: u64 = 0x0000_0200;
+const ICRNL: u64 = 0x0000_0100;
+const INLCR: u64 = 0x0000_0040;
+const IGNCR: u64 = 0x0000_0080;
+const BRKINT: u64 = 0x0000_0002;
+const ISTRIP: u64 = 0x0000_0020;
+const VMIN: usize = 16;
+const VTIME: usize = 17;
+const TCSANOW: CInt = 0;
 
 #[repr(C)]
-#[derive(Default)]
-pub struct BY_HANDLE_FILE_INFORMATION {
-    pub dwFileAttributes: DWORD,
-    pub ftCreationTime: FILETIME,
-    pub ftLastAccessTime: FILETIME,
-    pub ftLastWriteTime: FILETIME,
-    pub dwVolumeSerialNumber: DWORD,
-    pub nFileSizeHigh: DWORD,
-    pub nFileSizeLow: DWORD,
-    pub nNumberOfLinks: DWORD,
-    pub nFileIndexHigh: DWORD,
-    pub nFileIndexLow: DWORD,
+#[derive(Clone, Copy, Default)]
+pub struct Winsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+// `struct stat` as the compiler lays it out on 64-bit macOS.
+#[repr(C)]
+struct Stat {
+    st_dev: i32,
+    st_mode: u16,
+    st_nlink: u16,
+    st_ino: u64,
+    st_uid: u32,
+    st_gid: u32,
+    st_rdev: i32,
+    st_atime: i64,
+    st_atime_nsec: i64,
+    st_mtime: i64,
+    st_mtime_nsec: i64,
+    st_ctime: i64,
+    st_ctime_nsec: i64,
+    st_birthtime: i64,
+    st_birthtime_nsec: i64,
+    st_size: i64,
+    st_blocks: i64,
+    st_blksize: i32,
+    st_flags: u32,
+    st_gen: u32,
+    st_lspare: i32,
+    st_qspare: [i64; 2],
+}
+
+const S_IFMT: u16 = 0o170000;
+const S_IFREG: u16 = 0o100000;
+const S_IFCHR: u16 = 0o020000;
+const S_IFBLK: u16 = 0o060000;
+const S_IFIFO: u16 = 0o010000;
+const S_IFSOCK: u16 = 0o140000;
+
+#[repr(C)]
+struct Timeval {
+    tv_sec: i64,
+    tv_usec: i32,
+    _pad: i32,
 }
 
 #[repr(C)]
-struct IO_STATUS_BLOCK {
-    status: usize,
-    information: usize,
+struct Rusage {
+    ru_utime: Timeval,
+    ru_stime: Timeval,
+    _rest: [i64; 14],
 }
 
-#[link(name = "ntdll")]
-extern "system" {
-    fn NtQueryInformationFile(h: HANDLE, iosb: *mut IO_STATUS_BLOCK, info: *mut core::ffi::c_void, len: u32, class: u32) -> i32;
-    #[allow(clippy::too_many_arguments)]
-    fn NtWriteFile(
-        h: HANDLE,
-        event: HANDLE,
-        apc: *mut core::ffi::c_void,
-        apc_context: *mut core::ffi::c_void,
-        iosb: *mut IO_STATUS_BLOCK,
-        buf: *const core::ffi::c_void,
-        len: u32,
-        offset: *const i64,
-        key: *const u32,
-    ) -> i32;
-    fn RtlNtStatusToDosError(status: i32) -> u32;
+const RUSAGE_SELF: CInt = 0;
+const RUSAGE_CHILDREN: CInt = -1;
+
+#[repr(C)]
+struct PollFd {
+    fd: CInt,
+    events: i16,
+    revents: i16,
+}
+const POLLIN: i16 = 0x0001;
+
+const SIGINT: CInt = 2;
+
+#[repr(C)]
+struct SigAction {
+    handler: usize,
+    mask: u32,
+    flags: CInt,
 }
 
-/// Write to the end of the file, wherever the handle's position is, as one append
-/// (FILE_WRITE_TO_END_OF_FILE), so that writers sharing the file can't land on the same
-/// offset. The position is left just past the data, at the end. Returns the bytes written.
-pub fn write_at_end(h: HANDLE, data: &[u8]) -> std::io::Result<usize> {
-    let mut iosb = IO_STATUS_BLOCK { status: 0, information: 0 };
-    let end: i64 = -1; // FILE_WRITE_TO_END_OF_FILE in the low part, -1 in the high part
-    let len = data.len().min(u32::MAX as usize) as u32;
-    let st = unsafe {
-        NtWriteFile(
-            h,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut iosb,
-            data.as_ptr() as *const _,
-            len,
-            &end,
-            std::ptr::null(),
-        )
+#[repr(C)]
+struct Passwd {
+    pw_name: *mut core::ffi::c_char,
+    pw_passwd: *mut core::ffi::c_char,
+    pw_uid: u32,
+    pw_gid: u32,
+    _rest: [u64; 8],
+}
+
+#[cfg(target_os = "macos")]
+const TIOCGWINSZ: u64 = 0x4008_7468;
+#[cfg(not(target_os = "macos"))]
+const TIOCGWINSZ: u64 = 0x5413;
+
+extern "C" {
+    fn isatty(fd: CInt) -> CInt;
+    fn ioctl(fd: CInt, request: u64, ...) -> CInt;
+    fn tcgetattr(fd: CInt, t: *mut Termios) -> CInt;
+    fn tcsetattr(fd: CInt, action: CInt, t: *const Termios) -> CInt;
+    fn fstat(fd: CInt, st: *mut Stat) -> CInt;
+    fn read(fd: CInt, buf: *mut core::ffi::c_void, n: usize) -> isize;
+    fn write(fd: CInt, buf: *const core::ffi::c_void, n: usize) -> isize;
+    fn poll(fds: *mut PollFd, n: u32, timeout: CInt) -> CInt;
+    fn close(fd: CInt) -> CInt;
+    fn kill(pid: CInt, sig: CInt) -> CInt;
+    fn getrusage(who: CInt, usage: *mut Rusage) -> CInt;
+    fn gethostname(name: *mut core::ffi::c_char, len: usize) -> CInt;
+    fn getuid() -> u32;
+    fn getpwuid(uid: u32) -> *mut Passwd;
+    fn sigaction(sig: CInt, act: *const SigAction, old: *mut SigAction) -> CInt;
+}
+
+fn fstat_fd(fd: CInt) -> Option<Stat> {
+    let mut st = Stat {
+        st_dev: 0,
+        st_mode: 0,
+        st_nlink: 0,
+        st_ino: 0,
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        st_atime: 0,
+        st_atime_nsec: 0,
+        st_mtime: 0,
+        st_mtime_nsec: 0,
+        st_ctime: 0,
+        st_ctime_nsec: 0,
+        st_birthtime: 0,
+        st_birthtime_nsec: 0,
+        st_size: 0,
+        st_blocks: 0,
+        st_blksize: 0,
+        st_flags: 0,
+        st_gen: 0,
+        st_lspare: 0,
+        st_qspare: [0; 2],
     };
-    if st < 0 {
-        return Err(std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(st) } as i32));
-    }
-    Ok(iosb.information)
+    (unsafe { fstat(fd, &mut st) } == 0).then_some(st)
 }
 
-const FILE_READ_DATA: DWORD = 0x0001;
-const FILE_WRITE_DATA: DWORD = 0x0002;
-const FILE_APPEND_DATA: DWORD = 0x0004;
-const FILE_GENERIC_READ: DWORD = 0x0012_0089;
-const FILE_GENERIC_WRITE: DWORD = 0x0012_0116;
-const FILE_ACCESS_INFORMATION: u32 = 8;
-const FILE_SHARE_ALL: DWORD = 0x7; // read | write | delete
-const FILE_END: DWORD = 2;
-
-fn valid(h: HANDLE) -> bool {
-    !h.is_null() && h as isize != -1
+pub fn std_handle(n: DWORD) -> HANDLE {
+    n as HANDLE
 }
 
-pub fn is_disk(h: HANDLE) -> bool {
-    valid(h) && unsafe { GetFileType(h) } == FILE_TYPE_DISK
+pub fn is_console(n: DWORD) -> bool {
+    unsafe { isatty(n as CInt) != 0 }
 }
 
-/// The access rights a handle was opened with.
-fn granted_access(h: HANDLE) -> Option<DWORD> {
-    let mut iosb = IO_STATUS_BLOCK { status: 0, information: 0 };
-    let mut flags: DWORD = 0;
-    let st = unsafe {
-        NtQueryInformationFile(h, &mut iosb, &mut flags as *mut DWORD as *mut _, 4, FILE_ACCESS_INFORMATION)
-    };
-    (st >= 0).then_some(flags)
-}
-
-/// Same file (volume and file index), not necessarily the same handle or file object.
-pub fn same_file(a: HANDLE, b: HANDLE) -> bool {
-    let mut x = BY_HANDLE_FILE_INFORMATION::default();
-    let mut y = BY_HANDLE_FILE_INFORMATION::default();
-    unsafe {
-        GetFileInformationByHandle(a, &mut x) != 0
-            && GetFileInformationByHandle(b, &mut y) != 0
-            && x.dwVolumeSerialNumber == y.dwVolumeSerialNumber
-            && (x.nFileIndexHigh, x.nFileIndexLow) == (y.nFileIndexHigh, y.nFileIndexLow)
-    }
-}
-
-/// For a disk file opened append-only (FILE_APPEND_DATA without FILE_WRITE_DATA), a second
-/// handle to it with ordinary write access. The caller owns it. None for any other handle,
-/// or if the file can't be opened again.
-fn reopen_append_only(h: HANDLE) -> Option<HANDLE> {
-    if !is_append_only(h) {
-        return None;
-    }
-    let acc = granted_access(h)?;
-    let want = FILE_GENERIC_WRITE | if acc & FILE_READ_DATA != 0 { FILE_GENERIC_READ } else { 0 };
-    let nh = unsafe { ReOpenFile(h, want, FILE_SHARE_ALL, 0) };
-    valid(nh).then_some(nh)
-}
-
-static STDOUT_APPEND: AtomicBool = AtomicBool::new(false);
-static STDERR_APPEND: AtomicBool = AtomicBool::new(false);
-
-/// Our parent may give us stdout or stderr opened append-only (Node's `'a'` flag, Rust's
-/// `OpenOptions::append`). MSYS programs take an inherited handle as writable only when it
-/// has FILE_WRITE_DATA, so every write the MSYS programs we start made to it would fail.
-/// Replace such a handle with a writable one to the same file and treat it like a `>>` file
-/// (`io::Handle::Append`): see `seek_std_append`. When stdout and stderr are the same file,
-/// they share one handle, and so one position, so their output can't overwrite each other.
-pub fn make_append_only_stdio_writable() {
-    let out = std_handle(STD_OUTPUT_HANDLE);
-    let err = std_handle(STD_ERROR_HANDLE);
-    let new_out = reopen_append_only(out);
-    if let Some(h) = new_out {
-        unsafe { SetStdHandle(STD_OUTPUT_HANDLE, h) };
-        STDOUT_APPEND.store(true, Ordering::SeqCst);
-    }
-    let new_err = match new_out {
-        Some(h) if out == err || (is_append_only(err) && same_file(out, err)) => Some(h),
-        _ => reopen_append_only(err),
-    };
-    if let Some(h) = new_err {
-        unsafe { SetStdHandle(STD_ERROR_HANDLE, h) };
-        STDERR_APPEND.store(true, Ordering::SeqCst);
-    }
-}
-
-/// Is `h` a disk file opened append-only?
-fn is_append_only(h: HANDLE) -> bool {
-    is_disk(h)
-        && granted_access(h).is_some_and(|a| a & FILE_APPEND_DATA != 0 && a & FILE_WRITE_DATA == 0)
-}
-
-/// Move stdout or stderr to the end of its file if `make_append_only_stdio_writable`
-/// replaced it, as O_APPEND would before a write. Called before we write to it and before
-/// a child inherits it.
-pub fn seek_std_append(n: DWORD) {
-    let flag = if n == STD_ERROR_HANDLE { &STDERR_APPEND } else { &STDOUT_APPEND };
-    if flag.load(Ordering::Relaxed) {
-        unsafe { SetFilePointerEx(std_handle(n), 0, std::ptr::null_mut(), FILE_END) };
-    }
-}
-
-#[link(name = "advapi32")]
-extern "system" {
-    pub fn GetUserNameW(buf: *mut u16, len: *mut DWORD) -> BOOL;
-}
-
-pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-unsafe extern "system" fn ctrl_handler(kind: DWORD) -> BOOL {
-    match kind {
-        0 | 1 => {
-            INTERRUPTED.store(true, Ordering::SeqCst);
-            1
-        }
+pub fn file_type(n: DWORD) -> DWORD {
+    match fstat_fd(n as CInt).map(|s| s.st_mode & S_IFMT) {
+        Some(S_IFREG) => FILE_TYPE_DISK,
+        Some(S_IFCHR) | Some(S_IFBLK) => FILE_TYPE_CHAR,
+        Some(S_IFIFO) | Some(S_IFSOCK) => FILE_TYPE_PIPE,
         _ => 0,
     }
 }
 
-pub fn install_ctrl_handler() {
-    unsafe {
-        SetConsoleCtrlHandler(Some(ctrl_handler), 1);
-    }
-}
-
-/// Clear an inherited "ignore Ctrl+C" attribute (set when a parent started us with
-/// CREATE_NEW_PROCESS_GROUP), so Ctrl+C reaches us and the children we start.
-pub fn clear_ctrl_c_ignore() {
-    unsafe {
-        SetConsoleCtrlHandler(None, 0);
-    }
-}
-
-pub fn take_interrupt() -> bool {
-    INTERRUPTED.swap(false, Ordering::SeqCst)
-}
-pub fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
-}
-
-/// Whether this process is attached to a console at all (GetConsoleCP fails without one).
-/// It isn't when a parent started us with DETACHED_PROCESS, e.g. an editor's or agent's
-/// background task. Then every console program we start would get a new visible console
-/// window, so run_external starts them with CREATE_NO_WINDOW instead (Cygwin does the
-/// same job with a hidden console).
-pub fn has_console() -> bool {
-    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *HAS.get_or_init(|| unsafe { GetConsoleCP() != 0 })
-}
-
-pub fn std_handle(n: DWORD) -> HANDLE {
-    unsafe { GetStdHandle(n) }
-}
-
-pub fn is_console(n: DWORD) -> bool {
-    let h = std_handle(n);
-    if h.is_null() || h as isize == -1 {
-        return false;
-    }
-    let mut m = 0;
-    unsafe { GetConsoleMode(h, &mut m) != 0 }
-}
-
-pub fn file_type(n: DWORD) -> DWORD {
-    let h = std_handle(n);
-    if h.is_null() || h as isize == -1 {
-        return 0;
-    }
-    unsafe { GetFileType(h) }
-}
-
-/// Console window size (columns, lines).
+/// Terminal size (columns, lines) of the first standard stream that has one.
 pub fn console_size() -> Option<(usize, usize)> {
     for n in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE, STD_INPUT_HANDLE] {
-        let h = std_handle(n);
-        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
-        if unsafe { GetConsoleScreenBufferInfo(h, &mut info) } != 0 {
-            let cols = (info.srWindow.Right - info.srWindow.Left + 1).max(1) as usize;
-            let lines = (info.srWindow.Bottom - info.srWindow.Top + 1).max(1) as usize;
-            return Some((cols, lines));
+        if let Some(s) = winsize(n as CInt) {
+            return Some(s);
         }
     }
     None
 }
 
-pub fn enable_vt_output() {
-    for n in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        let h = std_handle(n);
-        let mut m = 0;
-        unsafe {
-            if GetConsoleMode(h, &mut m) != 0 {
-                SetConsoleMode(h, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT);
-            }
-        }
+pub fn winsize(fd: CInt) -> Option<(usize, usize)> {
+    let mut ws = Winsize::default();
+    if unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize) } == 0 && ws.ws_col > 0 {
+        Some((ws.ws_col as usize, ws.ws_row as usize))
+    } else {
+        None
     }
 }
 
-pub fn kill_pid(pid: u32, code: u32) -> bool {
+pub fn read_fd(fd: CInt, buf: &mut [u8]) -> isize {
+    unsafe { read(fd, buf.as_mut_ptr() as *mut _, buf.len()) }
+}
+
+pub fn write_fd(fd: CInt, buf: &[u8]) -> isize {
+    unsafe { write(fd, buf.as_ptr() as *const _, buf.len()) }
+}
+
+/// Wait until stdin has input or `ms` elapses. Returns true if input is ready.
+pub fn wait_stdin(ms: u32) -> bool {
+    wait_fd(STD_INPUT_HANDLE as CInt, ms)
+}
+
+pub fn close_fd(fd: CInt) {
+    unsafe { close(fd) };
+}
+
+pub fn wait_fd(fd: CInt, ms: u32) -> bool {
+    let mut p = PollFd { fd, events: POLLIN, revents: 0 };
+    unsafe { poll(&mut p, 1, ms.min(i32::MAX as u32) as CInt) > 0 }
+}
+
+pub fn get_termios(fd: CInt) -> Option<Termios> {
+    let mut t = Termios::default();
+    (unsafe { tcgetattr(fd, &mut t) } == 0).then_some(t)
+}
+
+pub fn set_termios(fd: CInt, t: &Termios) -> bool {
+    unsafe { tcsetattr(fd, TCSANOW, t) == 0 }
+}
+
+/// No line buffering, no echo, no signal keys: every byte reaches the editor.
+pub fn raw_termios(t: &mut Termios) {
+    t.c_lflag &= !(ICANON | ECHO | ISIG | IEXTEN);
+    t.c_iflag &= !(IXON | ICRNL | INLCR | IGNCR | BRKINT | ISTRIP);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+}
+
+/// Canonical input without echo (the `read -s` case).
+pub fn no_echo_termios(t: &mut Termios) {
+    t.c_lflag &= !ECHO;
+}
+
+/// Terminal title, as an xterm OSC sequence. A no-op when stdout is not a terminal.
+pub fn set_title(t: &str) {
+    if is_console(STD_OUTPUT_HANDLE) {
+        let s = format!("\x1b]0;{}\x07", t);
+        let _ = write_fd(STD_OUTPUT_HANDLE as CInt, s.as_bytes());
+    }
+}
+
+pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigint(_: CInt) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+/// Take Ctrl+C ourselves so a running command can be cut short and the shell stays alive.
+pub fn install_ctrl_handler() {
+    let act = SigAction { handler: on_sigint as *const () as usize, mask: 0, flags: 0 };
     unsafe {
-        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if h.is_null() {
-            return false;
-        }
-        let ok = TerminateProcess(h, code) != 0;
-        CloseHandle(h);
-        ok
+        sigaction(SIGINT, &act, std::ptr::null_mut());
     }
 }
 
-/// Whether the process behind a handle we hold is still running.
-pub fn process_running(h: HANDLE) -> bool {
-    unsafe { WaitForSingleObject(h, 0) != WAIT_OBJECT_0 }
+pub fn clear_ctrl_c_ignore() {
+    // Installing our own handler above already replaces an inherited SIG_IGN.
+}
+
+pub fn take_interrupt() -> bool {
+    INTERRUPTED.swap(false, Ordering::SeqCst)
+}
+
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// Whether this process has a terminal on any standard stream.
+pub fn has_console() -> bool {
+    is_console(STD_INPUT_HANDLE) || is_console(STD_OUTPUT_HANDLE) || is_console(STD_ERROR_HANDLE)
+}
+
+/// Send signal `sig` to `pid`. The exit status bash reports (128+sig) is built by the caller.
+pub fn kill_pid(pid: u32, sig: u32) -> bool {
+    unsafe { kill(pid as CInt, sig as CInt) == 0 }
 }
 
 pub fn pid_alive(pid: u32) -> bool {
-    unsafe {
-        let h = OpenProcess(SYNCHRONIZE, 0, pid);
-        if h.is_null() {
-            return false;
-        }
-        let r = WaitForSingleObject(h, 0);
-        CloseHandle(h);
-        r != WAIT_OBJECT_0
+    if unsafe { kill(pid as CInt, 0) } == 0 {
+        return true;
     }
+    std::io::Error::last_os_error().raw_os_error() == Some(1) // EPERM: exists, not ours
 }
 
-fn ft_secs(f: &FILETIME) -> f64 {
-    let v = ((f.hi as u64) << 32) | f.lo as u64;
-    v as f64 / 10_000_000.0
-}
-
-/// (user, system) CPU seconds of another process (by handle).
-pub fn handle_times(h: HANDLE) -> (f64, f64) {
-    let mut c = FILETIME::default();
-    let mut e = FILETIME::default();
-    let mut k = FILETIME::default();
-    let mut u = FILETIME::default();
-    unsafe {
-        if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 {
-            return (ft_secs(&u), ft_secs(&k));
-        }
+fn rusage(who: CInt) -> (f64, f64) {
+    let mut r = Rusage { ru_utime: Timeval { tv_sec: 0, tv_usec: 0, _pad: 0 }, ru_stime: Timeval { tv_sec: 0, tv_usec: 0, _pad: 0 }, _rest: [0; 14] };
+    if unsafe { getrusage(who, &mut r) } != 0 {
+        return (0.0, 0.0);
     }
-    (0.0, 0.0)
-}
-
-/// Accumulated CPU time of child processes waited for by this process.
-pub static CHILD_CPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static CHILD_SYS_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-pub fn add_child_times(u: f64, s: f64) {
-    CHILD_CPU_US.fetch_add((u * 1e6) as u64, Ordering::SeqCst);
-    CHILD_SYS_US.fetch_add((s * 1e6) as u64, Ordering::SeqCst);
-}
-
-/// (user, system) CPU seconds of this process plus waited-for children.
-pub fn total_times() -> (f64, f64) {
-    let (u, s) = process_times();
-    (u + CHILD_CPU_US.load(Ordering::SeqCst) as f64 / 1e6, s + CHILD_SYS_US.load(Ordering::SeqCst) as f64 / 1e6)
+    let f = |t: &Timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    (f(&r.ru_utime), f(&r.ru_stime))
 }
 
 /// (user, system) CPU seconds of this process.
 pub fn process_times() -> (f64, f64) {
-    let mut c = FILETIME::default();
-    let mut e = FILETIME::default();
-    let mut k = FILETIME::default();
-    let mut u = FILETIME::default();
-    unsafe {
-        if GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) != 0 {
-            return (ft_secs(&u), ft_secs(&k));
-        }
-    }
-    (0.0, 0.0)
+    rusage(RUSAGE_SELF)
+}
+
+/// (user, system) CPU seconds of this process plus waited-for children.
+pub fn total_times() -> (f64, f64) {
+    let (u1, s1) = rusage(RUSAGE_SELF);
+    let (u2, s2) = rusage(RUSAGE_CHILDREN);
+    (u1 + u2, s1 + s2)
 }
 
 pub fn user_name() -> String {
-    if let Ok(u) = std::env::var("USERNAME") {
-        return u;
+    if let Ok(u) = std::env::var("USER") {
+        if !u.is_empty() {
+            return u;
+        }
     }
-    let mut buf = [0u16; 257];
-    let mut len = buf.len() as DWORD;
     unsafe {
-        if GetUserNameW(buf.as_mut_ptr(), &mut len) != 0 && len > 0 {
-            return String::from_utf16_lossy(&buf[..(len - 1) as usize]);
+        let pw = getpwuid(getuid());
+        if !pw.is_null() && !(*pw).pw_name.is_null() {
+            return std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned();
         }
     }
     "user".into()
 }
 
 pub fn host_name() -> String {
-    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".into())
-}
-
-pub fn set_title(t: &str) {
-    let w: Vec<u16> = t.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        SetConsoleTitleW(w.as_ptr());
-    }
-}
-
-/// Wait until the console input handle has input or `ms` elapses. Returns true if input is ready.
-pub fn wait_stdin(ms: u32) -> bool {
-    let h = std_handle(STD_INPUT_HANDLE);
-    unsafe { WaitForSingleObject(h, ms) == WAIT_OBJECT_0 }
-}
-
-pub struct ConsoleCp {
-    out: u32,
-    inp: u32,
-}
-
-pub fn set_utf8_console() -> Option<ConsoleCp> {
-    unsafe {
-        let out = GetConsoleOutputCP();
-        let inp = GetConsoleCP();
-        if out == 0 {
-            return None;
-        }
-        SetConsoleOutputCP(65001);
-        SetConsoleCP(65001);
-        Some(ConsoleCp { out, inp })
-    }
-}
-
-impl Drop for ConsoleCp {
-    fn drop(&mut self) {
-        unsafe {
-            SetConsoleOutputCP(self.out);
-            SetConsoleCP(self.inp);
+    let mut buf = [0u8; 256];
+    if unsafe { gethostname(buf.as_mut_ptr() as *mut _, buf.len()) } == 0 {
+        if let Some(n) = buf.iter().position(|&b| b == 0) {
+            return String::from_utf8_lossy(&buf[..n]).into_owned();
         }
     }
+    "localhost".into()
+}
+
+// The Windows shell needed these; on Unix the terminal already handles them.
+pub fn enable_vt_output() {}
+pub fn make_append_only_stdio_writable() {}
+pub fn seek_std_append(_n: DWORD) {}
+pub fn set_utf8_console() -> Option<()> {
+    None
 }
