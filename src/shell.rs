@@ -1074,7 +1074,7 @@ impl Shell {
         v.attrs |= EXPORT;
     }
 
-    /// Environment for a child process (values converted for native Windows programs).
+    /// Environment for a child process.
     ///
     /// MSYS programs and child gash processes get POSIX values, except PATH, TMP and TEMP, which
     /// are converted to Windows form because the MSYS runtime reads them from the Windows

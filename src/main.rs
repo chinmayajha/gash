@@ -1,4 +1,4 @@
-//! gash — a fast, native, bash-compatible shell for Windows.
+//! gash — a fast, native, bash-compatible shell for macOS.
 #![allow(dead_code)]
 
 mod arith;
@@ -109,8 +109,8 @@ fn parse_cli(argv: &[String], name: &str, report: bool) -> Result<Cli, i32> {
                 "noediting" | "restricted" | "debugger" | "dump-strings" | "dump-po-strings" | "wordexp" | "pretty-print" => {}
                 "version" => {
                     if report {
-                        println!("gash {} (bash-compatible shell for Windows; BASH_VERSION {})", env!("CARGO_PKG_VERSION"), BASH_VERSION);
-                        println!("A from-scratch native replacement for Git Bash. License: MIT.");
+                        println!("gash {} (bash-compatible shell for macOS; BASH_VERSION {})", env!("CARGO_PKG_VERSION"), BASH_VERSION);
+                        println!("A from-scratch native bash-compatible shell. License: MIT.");
                     }
                     return Err(0);
                 }

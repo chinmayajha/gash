@@ -90,7 +90,7 @@ pub fn run(sh: &mut Shell, argv: &[String]) -> R {
         "caller" => caller(sh, args),
         "compgen" => compgen(sh, args),
         "complete" | "compopt" | "bind" => Ok(0),
-        "suspend" => usage_err(sh, name, "cannot suspend a shell on Windows"),
+        "suspend" => usage_err(sh, name, "cannot suspend a shell"),
         "fc" => usage_err(sh, name, "not supported"),
         "__git_ps1" => git_ps1(sh, args),
         _ => {
@@ -396,7 +396,7 @@ pub fn physical_pwd(sh: &Shell) -> String {
     path::to_posix(&physical_cwd(sh))
 }
 
-/// The current directory with symlinks resolved, as a Windows path.
+/// The current directory with symlinks resolved.
 fn physical_cwd(sh: &Shell) -> std::path::PathBuf {
     match std::fs::canonicalize(&sh.cwd) {
         Ok(c) => {
@@ -1715,7 +1715,7 @@ fn enable(sh: &mut Shell, args: &[String]) -> R {
 }
 
 fn help(sh: &mut Shell, _args: &[String]) -> R {
-    let mut out = format!("gash {} - a fast native bash-compatible shell for Windows\nBuiltins:\n", env!("CARGO_PKG_VERSION"));
+    let mut out = format!("gash {} - a fast native bash-compatible shell for macOS\nBuiltins:\n", env!("CARGO_PKG_VERSION"));
     for chunk in BUILTINS.chunks(8) {
         out.push_str("  ");
         out.push_str(&chunk.join(" "));
