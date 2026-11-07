@@ -1,4 +1,3 @@
-wc() { command wc "$@" | tr -d ' '; }
 # basic redirections: > >> < 2>&1 &> 2>/dev/null >&2
 tmp=$(mktemp -d) || exit 1
 cd "$tmp" || exit 1

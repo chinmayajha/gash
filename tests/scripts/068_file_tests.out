@@ -1,0 +1,6 @@
+[ls] -e -f -x -s
+[true] -e -f -x -s
+[nosuch]
+[]
+[[ -x ]] finds sed
+sed is executable

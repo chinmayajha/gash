@@ -10,19 +10,16 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-/// Here-document and here-string input. It starts in memory so builtins can read it
-/// cheaply. The first time it's handed to a child process, the unread part moves to a
-/// temporary file that the shell and every later child share, as bash does: a child that
-/// reads only part of it, or none, leaves the rest for the next reader.
+/// Here-document and here-string input, held in memory until a child needs it as a pipe or file.
 #[derive(Debug, Default)]
 pub struct MemReader {
     data: Vec<u8>,
     pos: usize,
-    /// Where the input went once a child needed it: `Handle::File`.
+    /// Where the input went once a child needed it.
     shared: Option<Handle>,
 }
 
-/// Input larger than this is written to a file instead of being pumped through a pipe.
+/// Input up to this size goes through a pipe, as in bash; larger input goes in a file.
 const HEREDOC_PIPE_MAX: usize = 64 * 1024;
 
 impl MemReader {
@@ -30,81 +27,32 @@ impl MemReader {
         MemReader { data, pos: 0, shared: None }
     }
 
-    /// The file holding the unread input, creating it on first use.
+    /// The pipe or file holding the unread input, creating it on first use.
     fn shared(&mut self) -> io::Result<Handle> {
         if let Some(h) = &self.shared {
             return Ok(h.clone());
         }
-        // All of it, positioned after what builtins already read: a program that
-        // reopens the file by name (/dev/stdin) reads from the start, as with bash.
-        let mut f = temp_file()?;
-        f.write_all(&self.data)?;
-        f.seek(SeekFrom::Start(self.pos as u64))?;
-        let h = Handle::File(Arc::new(f));
+        let h = if self.data.len() - self.pos <= HEREDOC_PIPE_MAX {
+            let (r, mut w) = io::pipe()?;
+            let unread = self.data[self.pos..].to_vec();
+            std::thread::spawn(move || {
+                let _ = w.write_all(&unread);
+            });
+            Handle::PipeR(Arc::new(r))
+        } else {
+            let mut f = temp_file()?;
+            f.write_all(&self.data)?;
+            f.seek(SeekFrom::Start(self.pos as u64))?;
+            Handle::File(Arc::new(f))
+        };
         self.data = Vec::new();
         self.pos = 0;
         self.shared = Some(h.clone());
         Ok(h)
     }
-
-    /// The unread input as a file, for a child whose arguments name it
-    /// (`/dev/stdin`, `/dev/fd/0`, `/proc/self/fd/0`).
-    ///
-    /// Returns `None` when the input is already in a file, which the child then shares
-    /// as usual. Otherwise the input moves to a new file for the duration of the child,
-    /// and [`MemReader::return_file`] must be called once the child has exited.
-    pub fn lend_file(&mut self) -> io::Result<Option<Arc<File>>> {
-        let rest = match &self.shared {
-            Some(Handle::File(_)) => return Ok(None),
-            Some(h) => {
-                let mut v = Vec::new();
-                let mut buf = [0u8; 8192];
-                while let Ok(n @ 1..) = h.read(&mut buf) {
-                    v.extend_from_slice(&buf[..n]);
-                }
-                v
-            }
-            None => self.data.split_off(self.pos),
-        };
-        let mut f = temp_file()?;
-        f.write_all(&rest)?;
-        f.seek(SeekFrom::Start(0))?;
-        let f = Arc::new(f);
-        self.data = Vec::new();
-        self.pos = 0;
-        self.shared = Some(Handle::File(f.clone()));
-        Ok(Some(f))
-    }
-
-    /// After a child that got [`MemReader::lend_file`]'s file has exited: put what is left
-    /// back in a pipe, as bash would have had it all along.
-    ///
-    /// With bash the child would have reopened that pipe, and whatever it read through
-    /// /dev/stdin would be gone. Reads through a reopened file don't move our position,
-    /// so they can't be measured: if the child didn't read through its stdin handle at
-    /// all, it is taken to have read everything by name. (Most programs read a file
-    /// they are given to the end.)
-    pub fn return_file(&mut self, f: &Arc<File>) {
-        if !matches!(&self.shared, Some(Handle::File(s)) if Arc::ptr_eq(s, f)) {
-            return;
-        }
-        let mut rest = Vec::new();
-        if (&**f).stream_position().map(|p| p > 0).unwrap_or(false) {
-            let _ = (&**f).read_to_end(&mut rest);
-        }
-        if rest.len() > HEREDOC_PIPE_MAX {
-            return;
-        }
-        self.shared = None;
-        self.data = rest;
-        self.pos = 0;
-        // On failure it stays in memory, and the next child gets it through a pump thread.
-        let _ = self.shared();
-    }
 }
 
-/// A new temporary file that disappears from the directory at once; it lives as long as
-/// any process holds a descriptor to it.
+/// A temporary file with no directory entry; it lives while a descriptor to it is open.
 fn temp_file() -> io::Result<File> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -139,8 +87,7 @@ pub enum Handle {
     Stdout,
     Stderr,
     File(Arc<File>),
-    /// A file opened with `>>`. Its descriptor carries `O_APPEND`, so every write, ours
-    /// or a child's, goes to the end of the file atomically.
+    /// A file opened with `>>`; `O_APPEND` makes every write atomic.
     Append(Arc<File>),
     PipeR(Arc<PipeReader>),
     PipeW(Arc<PipeWriter>),
@@ -166,19 +113,17 @@ impl std::fmt::Debug for Handle {
     }
 }
 
-fn raw_std(n: sys::DWORD) -> ManuallyDrop<File> {
-    unsafe { ManuallyDrop::new(File::from_raw_fd(sys::std_handle(n))) }
+fn raw_std(fd: sys::Fd) -> ManuallyDrop<File> {
+    unsafe { ManuallyDrop::new(File::from_raw_fd(fd)) }
 }
 
 pub fn console_stdin() -> bool {
-    sys::is_console(sys::STD_INPUT_HANDLE)
+    sys::is_tty(sys::STDIN_FD)
 }
 
-/// Write bytes to the process stdout/stderr, unbuffered so output is ordered with what
-/// children write to the same descriptor.
+/// Write to the process stdout or stderr unbuffered, so the order matches what children write.
 fn write_std(err: bool, data: &[u8]) -> io::Result<()> {
-    sys::seek_std_append(if err { sys::STD_ERROR_HANDLE } else { sys::STD_OUTPUT_HANDLE });
-    let f = raw_std(if err { sys::STD_ERROR_HANDLE } else { sys::STD_OUTPUT_HANDLE });
+    let f = raw_std(if err { sys::STDERR_FD } else { sys::STDOUT_FD });
     (&*f).write_all(data)
 }
 
@@ -203,15 +148,11 @@ impl Handle {
 
     pub fn is_console(&self) -> bool {
         match self {
-            Handle::Stdin => sys::is_console(sys::STD_INPUT_HANDLE),
-            Handle::Stdout => sys::is_console(sys::STD_OUTPUT_HANDLE),
-            Handle::Stderr => sys::is_console(sys::STD_ERROR_HANDLE),
+            Handle::Stdin => sys::is_tty(sys::STDIN_FD),
+            Handle::Stdout => sys::is_tty(sys::STDOUT_FD),
+            Handle::Stderr => sys::is_tty(sys::STDERR_FD),
             _ => false,
         }
-    }
-
-    pub fn readable(&self) -> bool {
-        matches!(self, Handle::Stdin | Handle::File(_) | Handle::PipeR(_) | Handle::Mem(_) | Handle::Null)
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -219,7 +160,7 @@ impl Handle {
             // Unbuffered: a buffered stdin would read past what this call was asked for
             // and swallow input meant for a child or the next command.
             Handle::Stdin => {
-                let f = raw_std(sys::STD_INPUT_HANDLE);
+                let f = raw_std(sys::STDIN_FD);
                 (&*f).read(buf)
             }
             Handle::File(f) => (&**f).read(buf),
@@ -303,8 +244,8 @@ impl Handle {
                 }
                 Ok((out, false))
             }
-            Handle::Stdin if sys::file_type(sys::STD_INPUT_HANDLE) == sys::FILE_TYPE_DISK => {
-                let f = raw_std(sys::STD_INPUT_HANDLE);
+            Handle::Stdin if sys::is_regular_file(sys::STDIN_FD) => {
+                let f = raw_std(sys::STDIN_FD);
                 read_until_seekable(&f, delim, limit)
             }
             _ => {
@@ -335,7 +276,6 @@ impl Handle {
                 }
             }
             Handle::Stdout => {
-                sys::seek_std_append(sys::STD_OUTPUT_HANDLE);
                 if fd == 1 {
                     (Stdio::inherit(), None)
                 } else {
@@ -343,7 +283,6 @@ impl Handle {
                 }
             }
             Handle::Stderr => {
-                sys::seek_std_append(sys::STD_ERROR_HANDLE);
                 if fd == 2 {
                     (Stdio::inherit(), None)
                 } else {
@@ -458,15 +397,3 @@ impl Fds {
         fd
     }
 }
-
-/// A file just opened with `>>`. Its descriptor carries `O_APPEND`, so the kernel puts
-/// every write at the current end and separate writers cannot land on the same offset.
-pub fn shared_append(f: File) -> Arc<File> {
-    Arc::new(f)
-}
-
-/// No bookkeeping needed on Unix: `O_APPEND` is shared with every child through the
-/// descriptor itself.
-pub fn append_started(_files: &[Arc<File>], _child: &std::process::Child) {}
-
-pub fn prune_append_files() {}

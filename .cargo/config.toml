@@ -1,5 +1,0 @@
-# Link the C runtime statically, so gash.exe doesn't need the Visual C++ Redistributable
-# (VCRUNTIME140.dll), which a clean Windows install doesn't always have. The UCRT parts
-# (api-ms-win-crt-*) are linked in too; only system DLLs remain.
-[target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "target-feature=+crt-static"]

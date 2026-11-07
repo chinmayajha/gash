@@ -1,4 +1,3 @@
-wc() { command wc "$@" | tr -d ' '; }
 # redirections on compound commands, >| and noclobber
 tmp=$(mktemp -d) || exit 1
 cd "$tmp" || exit 1

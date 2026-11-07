@@ -1,7 +1,0 @@
-[ls] -e -f -x -s
-[ls.exe] -e -f -x -s
-[git] -e -f -x -s
-[nosuch]
-[]
-[[ -x ]] finds sed
-git is executable

@@ -1,4 +1,3 @@
-wc() { command wc "$@" | tr -d ' '; }
 # here-documents and here-strings
 name=World
 cat <<EOF

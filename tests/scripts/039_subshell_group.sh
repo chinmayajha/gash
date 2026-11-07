@@ -1,4 +1,3 @@
-wc() { command wc "$@" | tr -d ' '; }
 # subshell ( ) isolation vs { } groups
 x=outer
 (x=inner; echo "c1: in subshell $x")

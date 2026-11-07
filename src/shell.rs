@@ -2,6 +2,7 @@
 
 use crate::ast::*;
 use crate::io::{Fds, Handle};
+use crate::sys::SignalMode;
 use crate::vars::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -184,9 +185,31 @@ pub mod sho {
     sh_idx!(checkwinsize, "checkwinsize");
 }
 
+fn trappable_signal(name: &str) -> Option<i32> {
+    crate::sys::signal_number(name).filter(|n| !matches!(*n, crate::sys::SIGCHLD | crate::sys::SIGWINCH))
+}
+
+fn machtype() -> String {
+    format!("{}-apple-darwin{}", crate::sys::cpu_arch(), crate::sys::os_release())
+}
+
 pub enum JobKind {
     Proc(std::process::Child),
     Thread(Option<std::thread::JoinHandle<i32>>),
+}
+
+pub struct ProcSubst {
+    pub path: PathBuf,
+    pub input: bool,
+    pub thread: std::thread::JoinHandle<i32>,
+    pub cancel: Arc<AtomicBool>,
+    pub child_pid: Arc<AtomicU32>,
+}
+
+#[derive(Default)]
+pub struct ExecReplace {
+    pub arg0: Option<String>,
+    pub clear_env: bool,
 }
 
 pub struct Job {
@@ -233,10 +256,9 @@ impl Job {
     }
     /// Stop the job with signal `sig`.
     pub fn kill(&mut self, sig: i32) {
-        let sig = sig as u32;
         match &mut self.kind {
             JobKind::Proc(c) => {
-                if !crate::sys::kill_pid(c.id(), sig) {
+                if !crate::sys::kill_pid(c.id() as i32, sig) {
                     let _ = c.kill();
                 }
             }
@@ -244,17 +266,67 @@ impl Job {
                 self.cancel.store(true, Ordering::SeqCst);
                 let p = self.child_pid.load(Ordering::SeqCst);
                 if p != 0 {
-                    crate::sys::kill_pid(p, sig);
+                    crate::sys::kill_pid(p as i32, sig);
                 }
             }
         }
     }
 }
 
+const MAX_FINISHED_JOBS: usize = 1024;
+
 #[derive(Default)]
 pub struct Jobs {
     pub list: Vec<Job>,
     pub last_id: usize,
+    pub disowned: Vec<std::process::Child>,
+    pub disowned_status: HashMap<u32, i32>,
+}
+
+impl Jobs {
+    /// Collect the exit status of every finished child so none stays a zombie.
+    pub fn reap(&mut self) {
+        for j in self.list.iter_mut().filter(|j| j.status.is_none()) {
+            j.poll();
+        }
+        let status = &mut self.disowned_status;
+        self.disowned.retain_mut(|c| match c.try_wait() {
+            Ok(None) => true,
+            Ok(Some(st)) => {
+                if status.len() >= MAX_FINISHED_JOBS {
+                    status.clear();
+                }
+                status.insert(c.id(), crate::exec::exit_code(st));
+                false
+            }
+            Err(_) => false,
+        });
+        if self.list.len() > MAX_FINISHED_JOBS {
+            let excess = self.list.len() - MAX_FINISHED_JOBS;
+            let mut dropped = 0;
+            self.list.retain(|j| {
+                let drop_it = dropped < excess && j.status.is_some();
+                dropped += drop_it as usize;
+                !drop_it
+            });
+        }
+    }
+
+    pub fn disown(&mut self, job: Job) {
+        if let JobKind::Proc(c) = job.kind {
+            self.disowned.push(c);
+        }
+    }
+
+    /// Exit status of a disowned child, waiting for it if it still runs.
+    pub fn wait_disowned(&mut self, pid: u32) -> Option<i32> {
+        if let Some(st) = self.disowned_status.remove(&pid) {
+            return Some(st);
+        }
+        let i = self.disowned.iter().position(|c| c.id() == pid)?;
+        let mut child = self.disowned.remove(i);
+        Some(child.wait().map(crate::exec::exit_code).unwrap_or(127))
+    }
 }
 
 #[derive(Clone)]
@@ -278,7 +350,7 @@ pub enum ExeKind {
 pub struct Resolved {
     pub path: PathBuf,
     pub kind: ExeKind,
-    pub interp: Option<(PathBuf, ExeKind, Option<String>)>,
+    pub interp: Option<(PathBuf, Option<String>)>,
     /// For ExeKind::Script: the options on its `#!` line, as bash would be given them.
     pub opts: Vec<String>,
 }
@@ -330,13 +402,14 @@ pub struct Shell {
     pub exit_trap_done: bool,
     pub spawn_only: bool,
     pub spawned: Option<std::process::Child>,
-    pub procsubst: Vec<(PathBuf, Option<Arc<Program>>)>,
+    pub procsubst: Vec<ProcSubst>,
     pub cmdsubst_status: Option<i32>,
     pub name: String,
     pub history: Arc<Mutex<Vec<String>>>,
     pub sourcing: usize,
     pub disabled_builtins: Arc<HashSet<String>>,
     pub umask: u32,
+    pub replace_process: Option<ExecReplace>,
     pub is_subshell: bool,
     pub script_mode: bool,
     pub decl_arrays: HashMap<usize, Vec<(Option<String>, String)>>,
@@ -370,7 +443,7 @@ impl Shell {
         o[O_HASHALL] = true;
         o[O_INTERACTIVE_COMMENTS] = true;
         let sh = SHOPTS.iter().map(|(_, d)| *d).collect();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         Shell {
             vars: Vars::default(),
             funcs: Arc::new(HashMap::new()),
@@ -417,7 +490,8 @@ impl Shell {
             history: Arc::new(Mutex::new(Vec::new())),
             sourcing: 0,
             disabled_builtins: Arc::new(HashSet::new()),
-            umask: 0o022,
+            umask: crate::sys::startup_umask(),
+            replace_process: None,
             is_subshell: false,
             script_mode: false,
             decl_arrays: HashMap::new(),
@@ -487,6 +561,7 @@ impl Shell {
             sourcing: self.sourcing,
             disabled_builtins: self.disabled_builtins.clone(),
             umask: self.umask,
+            replace_process: None,
             is_subshell: true,
             script_mode: self.script_mode,
             decl_arrays: HashMap::new(),
@@ -553,23 +628,25 @@ impl Shell {
         set(self, "OPTIND", "1");
         set(self, "OPTERR", "1");
         set(self, "BASH_VERSION", crate::BASH_VERSION);
-        set(self, "HOSTTYPE", "x86_64");
-        set(self, "OSTYPE", "msys");
-        set(self, "MACHTYPE", "x86_64-pc-msys");
+        let release = crate::sys::os_release();
+        set(self, "HOSTTYPE", crate::sys::cpu_arch());
+        set(self, "OSTYPE", &format!("darwin{}", release));
+        set(self, "MACHTYPE", &machtype());
         let host = crate::sys::host_name();
         set(self, "HOSTNAME", &host);
-        set(self, "UID", "197609");
-        set(self, "EUID", "197609");
-        set(self, "PPID", "1");
+        set(self, "UID", &crate::sys::user_id().to_string());
+        set(self, "EUID", &crate::sys::effective_user_id().to_string());
+        set(self, "PPID", &crate::sys::parent_pid().to_string());
         set(self, "HISTFILE", "");
-        let ver: BTreeMap<i64, String> = crate::BASH_VERSINFO.iter().enumerate().map(|(i, s)| (i as i64, s.to_string())).collect();
+        let ver: BTreeMap<i64, String> =
+            crate::BASH_VERSINFO.iter().map(|s| s.to_string()).chain(std::iter::once(machtype())).enumerate().map(|(i, s)| (i as i64, s)).collect();
         let v = self.vars.global_mut("BASH_VERSINFO");
         if v.value.is_none() {
             v.value = Some(Value::Arr(ver));
             v.attrs |= READONLY | ARRAY;
         }
         if self.get_str("PWD").map(|p| p.is_empty()).unwrap_or(true) || self.vars.get("PWD").is_some() {
-            let pwd = crate::path::to_posix(&self.cwd);
+            let pwd = crate::path::path_str(&self.cwd);
             let v = self.vars.global_mut("PWD");
             let attrs = v.attrs;
             *v = Var::new(Value::Str(pwd), attrs | EXPORT);
@@ -1075,24 +1152,16 @@ impl Shell {
     }
 
     /// Environment for a child process.
-    ///
-    /// MSYS programs and child gash processes get POSIX values, except PATH, TMP and TEMP, which
-    /// are converted to Windows form because the MSYS runtime reads them from the Windows
-    /// environment. It builds its `/tmp` mount (`usertemp` in /etc/fstab) from GetTempPathW,
-    /// which reads TMP/TEMP, and `TMP=/tmp` makes that `C:\tmp`. All running MSYS processes of
-    /// an installation share one mount table, so the first to start decides `/tmp` for the rest.
-    /// MSYS turns TMP/TEMP back into POSIX form at startup, so the program still sees `/tmp`.
-    /// A child gash also reads TEMP to find the folder behind `/tmp`.
     pub fn child_env(&mut self, extra: &[(String, String)]) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for (k, v) in extra {
-            seen.insert(k.to_uppercase());
+            seen.insert(k.clone());
             out.push((k.clone(), v.clone()));
         }
         let names = self.vars.names();
         for name in names {
-            if seen.contains(&name.to_uppercase()) {
+            if seen.contains(&name) {
                 continue;
             }
             let v = match self.vars.get(&name) {
@@ -1106,15 +1175,14 @@ impl Shell {
                 Some(Value::Str(s)) => s.clone(),
                 _ => continue,
             };
-            seen.insert(name.to_uppercase());
+            seen.insert(name.clone());
             out.push((name, val));
         }
         for (k, v) in self.env_extra.iter() {
-            if !seen.contains(&k.to_uppercase()) {
+            if !seen.contains(k) {
                 out.push((k.clone(), v.clone()));
             }
         }
-        // PWD for children reflects our virtual cwd
         out
     }
 
@@ -1131,10 +1199,17 @@ impl Shell {
         let t = Arc::make_mut(&mut self.traps);
         match action {
             Some(a) => {
+                let ignore = a.is_empty();
                 t.insert(sig.to_string(), a);
+                if let Some(n) = trappable_signal(sig) {
+                    crate::sys::set_signal(n, if ignore { SignalMode::Ignore } else { SignalMode::Catch });
+                }
             }
             None => {
                 t.remove(sig);
+                if let Some(n) = trappable_signal(sig) {
+                    crate::sys::set_signal(n, SignalMode::Default);
+                }
             }
         }
     }

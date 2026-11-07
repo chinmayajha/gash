@@ -23,6 +23,6 @@ pipe-1
 ls: /nonexistent: No such file or directory
 pipe-2
 builtin-1
-msys-fg
+prog-fg
 bg-late
 builtin-2

@@ -37,7 +37,7 @@ f2() { echo "c24: line in func $LINENO"; }
 f2
 x=1; echo "c25: assignment status $?"
 x=$(exit 3); echo "c26: cmdsub assignment status $?"
-unalias -a; alias | command wc -l | tr -d ' ' | sed 's/^/c27: after unalias -a: /'
+unalias -a; alias | wc -l | sed 's/^/c27: after unalias -a: /'
 alias multi='echo c28: one; echo c28: two'
 multi
 alias nested_alias='say c29: via nested alias'

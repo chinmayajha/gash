@@ -21,7 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use crate::sys::{self, HANDLE as Handle};
+use crate::sys::{self, Fd};
 
 // ===========================================================================
 // Public API
@@ -83,7 +83,7 @@ impl LineEditor {
 
     /// True if stdin is an interactive terminal.
     pub fn is_console() -> bool {
-        sys::is_console(sys::STD_INPUT_HANDLE)
+        sys::is_tty(sys::STDIN_FD)
     }
 
     /// Read one line.  See the module docs for details.
@@ -98,7 +98,7 @@ impl LineEditor {
         let Some(out) = OutputHandle::find() else {
             return read_line_fallback(prompt);
         };
-        let Some(_guard) = ModeGuard::enter(sys::STD_INPUT_HANDLE as Handle) else {
+        let Some(_guard) = ModeGuard::enter(sys::STDIN_FD) else {
             return read_line_fallback(prompt);
         };
         // Drop order: session, then _guard (restores the terminal mode), then out.
@@ -140,14 +140,14 @@ impl LineEditor {
 
 /// Where we draw: stdout if it is a terminal, else stderr.
 struct OutputHandle {
-    handle: Handle,
+    handle: Fd,
 }
 
 impl OutputHandle {
     fn find() -> Option<OutputHandle> {
-        for fd in [sys::STD_OUTPUT_HANDLE, sys::STD_ERROR_HANDLE] {
-            if sys::is_console(fd) {
-                return Some(OutputHandle { handle: fd as Handle });
+        for fd in [sys::STDOUT_FD, sys::STDERR_FD] {
+            if sys::is_tty(fd) {
+                return Some(OutputHandle { handle: fd });
             }
         }
         None
@@ -160,7 +160,7 @@ struct ModeGuard {
 }
 
 impl ModeGuard {
-    fn enter(fd: Handle) -> Option<ModeGuard> {
+    fn enter(fd: Fd) -> Option<ModeGuard> {
         let saved = sys::get_termios(fd)?;
         let mut raw = saved;
         sys::raw_termios(&mut raw);
@@ -173,23 +173,22 @@ impl ModeGuard {
 
 impl Drop for ModeGuard {
     fn drop(&mut self) {
-        sys::set_termios(sys::STD_INPUT_HANDLE as Handle, &self.saved);
+        sys::set_termios(sys::STDIN_FD, &self.saved);
     }
 }
 
-fn console_cols(h: Handle) -> usize {
+fn console_cols(h: Fd) -> usize {
     sys::winsize(h).map(|(c, _)| c).unwrap_or(80)
 }
 
 /// Ask the terminal for the cursor column (`ESC[6n`). Bytes that arrive before the
 /// answer (type-ahead) go back into the queue.
-fn cursor_column(h: Handle, q: &mut InputQueue) -> usize {
+fn cursor_column(h: Fd, q: &mut InputQueue) -> usize {
     if sys::write_fd(h, b"\x1b[6n") <= 0 {
         return 0;
     }
     let mut seen = Vec::new();
-    loop {
-        let Some(b) = q.read_byte(Some(50)) else { break };
+    while let Some(b) = q.read_byte(Some(50)) {
         seen.push(b);
         if b == b'R' {
             if let Some(i) = seen.windows(2).rposition(|w| w == b"\x1b[") {
@@ -209,7 +208,7 @@ fn cursor_column(h: Handle, q: &mut InputQueue) -> usize {
     0
 }
 
-fn write_console(h: Handle, s: &str) {
+fn write_console(h: Fd, s: &str) {
     let bytes = s.as_bytes();
     let mut off = 0;
     while off < bytes.len() {
@@ -256,7 +255,7 @@ fn read_raw_line() -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut b = 0u8;
     loop {
-        let n = sys::read_fd(sys::STD_INPUT_HANDLE as Handle, std::slice::from_mut(&mut b));
+        let n = sys::read_fd(sys::STDIN_FD, std::slice::from_mut(&mut b));
         if n == 0 {
             break;
         }
@@ -911,12 +910,12 @@ enum Key {
 /// Terminal input reader. Bytes are consumed one at a time, so nothing past the
 /// key that ends a line is taken from the terminal: it stays queued for a child.
 struct InputQueue {
-    fd: Handle,
+    fd: Fd,
     pending: VecDeque<u8>,
 }
 
 impl InputQueue {
-    fn new(fd: Handle) -> Self {
+    fn new(fd: Fd) -> Self {
         InputQueue { fd, pending: VecDeque::new() }
     }
 
@@ -950,7 +949,7 @@ impl InputQueue {
             if n == 0 {
                 return None;
             }
-            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted || sys::signal_pending() {
                 return None;
             }
         }
@@ -1083,7 +1082,7 @@ struct YankArg {
 
 struct Session<'a> {
     le: &'a mut LineEditor,
-    hout: Handle,
+    hout: Fd,
     queue: InputQueue,
     prompt: Prompt,
 
@@ -1112,12 +1111,12 @@ struct Session<'a> {
 type Completer<'c> = dyn FnMut(&str, usize) -> Completion + 'c;
 
 impl<'a> Session<'a> {
-    fn new(le: &'a mut LineEditor, hout: Handle, prompt: &str) -> Self {
+    fn new(le: &'a mut LineEditor, hout: Fd, prompt: &str) -> Self {
         let hist_idx = le.history.len();
         Session {
             le,
             hout,
-            queue: InputQueue::new(sys::STD_INPUT_HANDLE as Handle),
+            queue: InputQueue::new(sys::STDIN_FD),
             prompt: parse_prompt(prompt),
             buf: String::new(),
             cursor: 0,

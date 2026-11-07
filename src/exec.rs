@@ -8,6 +8,7 @@ use crate::shell::*;
 use crate::vars::*;
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command as Proc, ExitStatus, Stdio};
@@ -256,6 +257,7 @@ impl Shell {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Flow::Exit(143));
         }
+        self.dispatch_signals()?;
         if crate::sys::interrupted() {
             if let Some(t) = self.traps.get("INT").cloned() {
                 crate::sys::take_interrupt();
@@ -269,12 +271,42 @@ impl Shell {
         Ok(())
     }
 
+    /// Run traps for signals sent from outside; an untrapped hangup or terminate ends the shell.
+    pub fn dispatch_signals(&mut self) -> Result<(), Flow> {
+        if self.is_subshell || !crate::sys::signal_pending() {
+            return Ok(());
+        }
+        for sig in crate::sys::take_pending() {
+            let Some(name) = crate::sys::signal_name(sig) else {
+                continue;
+            };
+            match self.traps.get(name).cloned() {
+                Some(a) if a.is_empty() => {}
+                Some(_) => self.run_trap(name)?,
+                None if matches!(sig, crate::sys::SIGHUP | crate::sys::SIGTERM) => return Err(Flow::Exit(128 + sig)),
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn join_interruptible(&mut self, t: std::thread::JoinHandle<i32>) -> Result<i32, Flow> {
+        let mut nap = 20;
+        while !t.is_finished() {
+            self.dispatch_signals()?;
+            std::thread::sleep(std::time::Duration::from_micros(nap));
+            nap = (nap * 2).min(5000);
+        }
+        Ok(t.join().unwrap_or(1))
+    }
+
     // ---------- lists ----------
 
     pub fn exec_list(&mut self, list: &List) -> R {
         let mut st = self.status;
         for item in list {
             self.check_int()?;
+            self.jobs.reap();
             if item.background {
                 st = self.exec_background(item)?;
             } else {
@@ -468,7 +500,10 @@ impl Shell {
             prev = r;
         }
         drop(prev);
-        let mut sts: Vec<i32> = threads.into_iter().map(|t| t.join().unwrap_or(1)).collect();
+        let mut sts = Vec::with_capacity(threads.len() + 1);
+        for t in threads {
+            sts.push(self.join_interruptible(t)?);
+        }
         if let Some(s) = last_status {
             sts.push(s);
         }
@@ -483,9 +518,8 @@ impl Shell {
 
     fn exec_background(&mut self, item: &ListItem) -> R {
         let mut sub = self.subshell_clone();
-        // bash: without job control, `cmd &` reads /dev/null unless stdin was redirected
-        // (see Shell::stdin_redir); its own `<` redirections still apply afterwards.
-        if !self.interactive && !self.stdin_redir {
+        // No job control: a background job reads /dev/null unless stdin was redirected.
+        if !self.stdin_redir {
             sub.fds.set(0, Some(Handle::Null));
         }
         let id = self.jobs.list.iter().map(|j| j.id).max().unwrap_or(0) + 1;
@@ -1218,7 +1252,7 @@ impl Shell {
         }
         let name = &argv[0];
         if has_path_sep(name) {
-            let wp = path::to_win(name, &self.cwd);
+            let wp = path::resolve(name, &self.cwd);
             if wp.is_dir() {
                 self.eprint(&format!("{}: Is a directory", name));
                 return Ok(126);
@@ -1304,8 +1338,8 @@ impl Shell {
             return self.resolve_path_cmd(name);
         }
         for d in path::split_posix_list(pathvar) {
-            let wd = path::to_win(if d.is_empty() { "." } else { &d }, &self.cwd);
-            if let Some(r) = self.probe(&wd, name, true) {
+            let wd = path::resolve(if d.is_empty() { "." } else { &d }, &self.cwd);
+            if let Some(r) = self.classify_file(&wd.join(name)) {
                 return Some(r);
             }
         }
@@ -1313,16 +1347,12 @@ impl Shell {
     }
 
     fn resolve_path_cmd(&mut self, name: &str) -> Option<Resolved> {
-        let wp = path::to_win(name, &self.cwd);
-        self.classify_file(&wp, false)
+        let wp = path::resolve(name, &self.cwd);
+        self.classify_file(&wp)
     }
 
-    fn probe(&mut self, dir: &Path, name: &str, strict: bool) -> Option<Resolved> {
-        self.classify_file(&dir.join(name), strict)
-    }
-
-    /// Determine how to execute a file. `_strict` kept for the PATH-search callers.
-    pub fn classify_file(&mut self, p: &Path, _strict: bool) -> Option<Resolved> {
+    /// Determine how to execute a file.
+    pub fn classify_file(&mut self, p: &Path) -> Option<Resolved> {
         use std::os::unix::fs::PermissionsExt;
         let md = std::fs::metadata(p).ok()?;
         if !md.is_file() || md.permissions().mode() & 0o111 == 0 {
@@ -1357,14 +1387,14 @@ impl Shell {
                 return Some(Resolved { path: p.to_path_buf(), kind: ExeKind::Script, interp: None, opts });
             }
             let ip = if prog.contains('/') {
-                let w = path::to_win(&prog, &self.cwd);
+                let w = path::resolve(&prog, &self.cwd);
                 w.is_file().then_some(w)
             } else {
                 let pv = self.get_str("PATH").unwrap_or_default();
                 self.find_in_path(&prog, &pv).map(|r| r.path)
             };
             let ip = ip?;
-            return Some(Resolved { path: p.to_path_buf(), kind: ExeKind::Interp, interp: Some((ip, ExeKind::Native, arg)), opts: Vec::new() });
+            return Some(Resolved { path: p.to_path_buf(), kind: ExeKind::Interp, interp: Some((ip, arg)), opts: Vec::new() });
         }
         // No `#!`: an executable binary runs as is; text is run by us, as bash does when
         // `execve` fails with ENOEXEC.
@@ -1375,6 +1405,7 @@ impl Shell {
     // ---------- external commands ----------
 
     pub fn run_external(&mut self, res: &Resolved, argv: &[String], assigns: &[(String, String)]) -> R {
+        let replace = self.replace_process.take();
         if res.kind == ExeKind::Script && std::env::var_os("GASH_NO_INPROC").is_none() && !self.spawn_only {
             if let Some(r) = self.run_script_inproc(res, argv, assigns) {
                 return r;
@@ -1399,7 +1430,7 @@ impl Shell {
                 }
             }
             ExeKind::Interp => {
-                let (ip, _ik, iarg) = res.interp.clone().unwrap();
+                let (ip, iarg) = res.interp.clone().unwrap();
                 cmd = Proc::new(&ip);
                 if let Some(a) = iarg {
                     cmd.arg(a);
@@ -1412,8 +1443,10 @@ impl Shell {
         }
         cmd.current_dir(&self.cwd);
         cmd.env_clear();
-        for (k, v) in self.child_env(assigns) {
-            cmd.env(k, v);
+        if !replace.as_ref().is_some_and(|r| r.clear_env) {
+            for (k, v) in self.child_env(assigns) {
+                cmd.env(k, v);
+            }
         }
         let mut pumps = Vec::new();
         let mut closed = Vec::new();
@@ -1449,8 +1482,27 @@ impl Shell {
                 });
             }
         }
+        if self.umask != crate::sys::startup_umask() {
+            let mask = self.umask;
+            unsafe {
+                cmd.pre_exec(move || {
+                    crate::sys::set_process_umask(mask);
+                    Ok(())
+                });
+            }
+        }
         if self.spawn_only {
             cmd.process_group(0);
+        }
+        let top_level = !self.is_subshell && self.pid == std::process::id();
+        if let (Some(rep), true) = (&replace, pumps.is_empty() && !self.spawn_only && top_level) {
+            if let Some(a0) = &rep.arg0 {
+                cmd.arg0(a0);
+            }
+            let e = cmd.exec();
+            let code = if e.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 };
+            self.eprint(&format!("{}: {}", argv[0], io_err_msg(&e)));
+            return Ok(code);
         }
         let spawned = cmd.spawn();
         drop(cmd);
@@ -1467,8 +1519,9 @@ impl Shell {
             return Ok(0);
         }
         self.child_pid.store(child.id(), Ordering::SeqCst);
-        let st = child.wait();
+        let st = self.wait_foreground(&mut child);
         self.child_pid.store(0, Ordering::SeqCst);
+        let st = st?;
         for p in pumps {
             let _ = p.join();
         }
@@ -1485,6 +1538,25 @@ impl Shell {
             crate::sys::take_interrupt();
         }
         Ok(code)
+    }
+
+    /// Wait for a foreground child; a signal that wakes the wait runs its trap or ends the shell.
+    fn wait_foreground(&mut self, child: &mut std::process::Child) -> Result<std::io::Result<std::process::ExitStatus>, Flow> {
+        if self.is_subshell && !crate::sys::on_interpreter_thread() {
+            return Ok(child.wait());
+        }
+        loop {
+            match crate::sys::wait_pid(child.id() as i32) {
+                crate::sys::WaitOutcome::Exited(raw) => return Ok(Ok(std::process::ExitStatus::from_raw(raw))),
+                crate::sys::WaitOutcome::Interrupted if self.is_subshell => {
+                    if let Some(sig) = crate::sys::first_pending() {
+                        return Err(Flow::Exit(128 + sig));
+                    }
+                }
+                crate::sys::WaitOutcome::Interrupted => self.dispatch_signals()?,
+                crate::sys::WaitOutcome::Failed => return Ok(child.wait()),
+            }
+        }
     }
 
     /// `None` when the options on the script's `#!` line can't be applied in-process (see
@@ -1514,7 +1586,6 @@ impl Shell {
         for (fd, old) in saved.0.into_iter().rev() {
             self.fds.set(fd, old);
         }
-        crate::io::prune_append_files();
     }
 
     fn set_fd_saved(&mut self, fd: i32, h: Option<Handle>, saved: &mut Saved, persist: bool) {
@@ -1548,11 +1619,11 @@ impl Shell {
                 return self.fds.get(fd).cloned().ok_or_else(|| std::io::Error::other("Bad file descriptor"));
             }
         }
-        let wp = path::to_win(p, &self.cwd);
+        let wp = path::resolve(p, &self.cwd);
         let mut oo = std::fs::OpenOptions::new();
         oo.read(read);
         if write {
-            oo.write(true).create(true);
+            oo.write(true).create(true).mode(0o666 & !self.umask);
             if append {
                 oo.append(true);
             } else if truncate {
@@ -1561,7 +1632,7 @@ impl Shell {
         }
         let f = oo.open(&wp)?;
         if append && write {
-            return Ok(Handle::Append(crate::io::shared_append(f)));
+            return Ok(Handle::Append(Arc::new(f)));
         }
         Ok(Handle::File(Arc::new(f)))
     }
@@ -1577,6 +1648,10 @@ impl Shell {
             _ => 1,
         };
         let mut fd = r.fd.unwrap_or(default_fd);
+        if fd >= crate::sys::max_fds() {
+            self.eprint(&format!("{}: Bad file descriptor", fd));
+            return Err(RedirErr::Failed);
+        }
         let persist = r.fd_var.is_some();
         if let Some(var) = &r.fd_var {
             let closing = matches!(r.op, RedirOp::DupIn | RedirOp::DupOut)
@@ -1690,7 +1765,7 @@ impl Shell {
             }
             RedirOp::Out | RedirOp::Clobber => {
                 if r.op == RedirOp::Out && self.o[O_NOCLOBBER] && !target.starts_with("/dev/") {
-                    let wp = path::to_win(&target, &self.cwd);
+                    let wp = path::resolve(&target, &self.cwd);
                     if wp.is_file() {
                         self.eprint(&format!("{}: cannot overwrite existing file", target));
                         return Err(RedirErr::Failed);
@@ -1709,7 +1784,7 @@ impl Shell {
             }
             RedirOp::OutErr | RedirOp::AppendOutErr => {
                 let app = r.op == RedirOp::AppendOutErr;
-                if !app && self.o[O_NOCLOBBER] && !target.starts_with("/dev/") && path::to_win(&target, &self.cwd).is_file() {
+                if !app && self.o[O_NOCLOBBER] && !target.starts_with("/dev/") && path::resolve(&target, &self.cwd).is_file() {
                     self.eprint(&format!("{}: cannot overwrite existing file", target));
                     return Err(RedirErr::Failed);
                 }

@@ -1,17 +1,14 @@
-//! Minimal POSIX FFI (no external crates): terminals, signals, processes, CPU time.
+//! Minimal POSIX FFI (no external crates): terminals, signals, processes, limits.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ffi::{CStr, CString};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// A file descriptor. The shell's handle table is keyed by the same numbers.
-pub type HANDLE = i32;
-pub type DWORD = u32;
+pub type Fd = i32;
 
-pub const STD_INPUT_HANDLE: DWORD = 0;
-pub const STD_OUTPUT_HANDLE: DWORD = 1;
-pub const STD_ERROR_HANDLE: DWORD = 2;
-pub const FILE_TYPE_DISK: DWORD = 1;
-const FILE_TYPE_CHAR: DWORD = 2;
-const FILE_TYPE_PIPE: DWORD = 3;
+pub const STDIN_FD: Fd = 0;
+pub const STDOUT_FD: Fd = 1;
+pub const STDERR_FD: Fd = 2;
 
 type CInt = i32;
 
@@ -27,7 +24,6 @@ pub struct Termios {
     c_ospeed: u64,
 }
 
-// c_lflag / c_iflag bits (macOS sys/termios.h).
 const ISIG: u64 = 0x0000_0080;
 const ICANON: u64 = 0x0000_0100;
 const ECHO: u64 = 0x0000_0008;
@@ -51,7 +47,6 @@ pub struct Winsize {
     ws_ypixel: u16,
 }
 
-// `struct stat` as the compiler lays it out on 64-bit macOS.
 #[repr(C)]
 struct Stat {
     st_dev: i32,
@@ -80,10 +75,6 @@ struct Stat {
 
 const S_IFMT: u16 = 0o170000;
 const S_IFREG: u16 = 0o100000;
-const S_IFCHR: u16 = 0o020000;
-const S_IFBLK: u16 = 0o060000;
-const S_IFIFO: u16 = 0o010000;
-const S_IFSOCK: u16 = 0o140000;
 
 #[repr(C)]
 struct Timeval {
@@ -110,8 +101,6 @@ struct PollFd {
 }
 const POLLIN: i16 = 0x0001;
 
-const SIGINT: CInt = 2;
-
 #[repr(C)]
 struct SigAction {
     handler: usize,
@@ -125,13 +114,30 @@ struct Passwd {
     pw_passwd: *mut core::ffi::c_char,
     pw_uid: u32,
     pw_gid: u32,
-    _rest: [u64; 8],
+    pw_change: i64,
+    pw_class: *mut core::ffi::c_char,
+    pw_gecos: *mut core::ffi::c_char,
+    pw_dir: *mut core::ffi::c_char,
+    pw_shell: *mut core::ffi::c_char,
+    pw_expire: i64,
 }
 
-#[cfg(target_os = "macos")]
+#[repr(C)]
+struct RLimit {
+    cur: u64,
+    max: u64,
+}
+
+#[repr(C)]
+struct Utsname {
+    sysname: [u8; 256],
+    nodename: [u8; 256],
+    release: [u8; 256],
+    version: [u8; 256],
+    machine: [u8; 256],
+}
+
 const TIOCGWINSZ: u64 = 0x4008_7468;
-#[cfg(not(target_os = "macos"))]
-const TIOCGWINSZ: u64 = 0x5413;
 
 extern "C" {
     fn isatty(fd: CInt) -> CInt;
@@ -147,66 +153,41 @@ extern "C" {
     fn getrusage(who: CInt, usage: *mut Rusage) -> CInt;
     fn gethostname(name: *mut core::ffi::c_char, len: usize) -> CInt;
     fn getuid() -> u32;
+    fn geteuid() -> u32;
+    fn getegid() -> u32;
+    fn getppid() -> CInt;
     fn getpwuid(uid: u32) -> *mut Passwd;
+    fn getpwnam(name: *const core::ffi::c_char) -> *mut Passwd;
     fn sigaction(sig: CInt, act: *const SigAction, old: *mut SigAction) -> CInt;
+    fn pthread_sigmask(how: CInt, set: *const u32, old: *mut u32) -> CInt;
+    fn umask(mask: u32) -> u32;
+    fn access(path: *const core::ffi::c_char, mode: CInt) -> CInt;
+    fn mkfifo(path: *const core::ffi::c_char, mode: u32) -> CInt;
+    fn getrlimit(res: CInt, lim: *mut RLimit) -> CInt;
+    fn setrlimit(res: CInt, lim: *const RLimit) -> CInt;
+    fn uname(u: *mut Utsname) -> CInt;
+    fn waitpid(pid: CInt, status: *mut CInt, options: CInt) -> CInt;
 }
 
 fn fstat_fd(fd: CInt) -> Option<Stat> {
-    let mut st = Stat {
-        st_dev: 0,
-        st_mode: 0,
-        st_nlink: 0,
-        st_ino: 0,
-        st_uid: 0,
-        st_gid: 0,
-        st_rdev: 0,
-        st_atime: 0,
-        st_atime_nsec: 0,
-        st_mtime: 0,
-        st_mtime_nsec: 0,
-        st_ctime: 0,
-        st_ctime_nsec: 0,
-        st_birthtime: 0,
-        st_birthtime_nsec: 0,
-        st_size: 0,
-        st_blocks: 0,
-        st_blksize: 0,
-        st_flags: 0,
-        st_gen: 0,
-        st_lspare: 0,
-        st_qspare: [0; 2],
-    };
+    let mut st = unsafe { std::mem::zeroed::<Stat>() };
     (unsafe { fstat(fd, &mut st) } == 0).then_some(st)
 }
 
-pub fn std_handle(n: DWORD) -> HANDLE {
-    n as HANDLE
+pub fn is_tty(fd: Fd) -> bool {
+    unsafe { isatty(fd) != 0 }
 }
 
-pub fn is_console(n: DWORD) -> bool {
-    unsafe { isatty(n as CInt) != 0 }
-}
-
-pub fn file_type(n: DWORD) -> DWORD {
-    match fstat_fd(n as CInt).map(|s| s.st_mode & S_IFMT) {
-        Some(S_IFREG) => FILE_TYPE_DISK,
-        Some(S_IFCHR) | Some(S_IFBLK) => FILE_TYPE_CHAR,
-        Some(S_IFIFO) | Some(S_IFSOCK) => FILE_TYPE_PIPE,
-        _ => 0,
-    }
+pub fn is_regular_file(fd: Fd) -> bool {
+    fstat_fd(fd).map(|s| s.st_mode & S_IFMT == S_IFREG).unwrap_or(false)
 }
 
 /// Terminal size (columns, lines) of the first standard stream that has one.
-pub fn console_size() -> Option<(usize, usize)> {
-    for n in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE, STD_INPUT_HANDLE] {
-        if let Some(s) = winsize(n as CInt) {
-            return Some(s);
-        }
-    }
-    None
+pub fn terminal_size() -> Option<(usize, usize)> {
+    [STDOUT_FD, STDERR_FD, STDIN_FD].into_iter().find_map(winsize)
 }
 
-pub fn winsize(fd: CInt) -> Option<(usize, usize)> {
+pub fn winsize(fd: Fd) -> Option<(usize, usize)> {
     let mut ws = Winsize::default();
     if unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize) } == 0 && ws.ws_col > 0 {
         Some((ws.ws_col as usize, ws.ws_row as usize))
@@ -215,34 +196,34 @@ pub fn winsize(fd: CInt) -> Option<(usize, usize)> {
     }
 }
 
-pub fn read_fd(fd: CInt, buf: &mut [u8]) -> isize {
+pub fn read_fd(fd: Fd, buf: &mut [u8]) -> isize {
     unsafe { read(fd, buf.as_mut_ptr() as *mut _, buf.len()) }
 }
 
-pub fn write_fd(fd: CInt, buf: &[u8]) -> isize {
+pub fn write_fd(fd: Fd, buf: &[u8]) -> isize {
     unsafe { write(fd, buf.as_ptr() as *const _, buf.len()) }
 }
 
 /// Wait until stdin has input or `ms` elapses. Returns true if input is ready.
 pub fn wait_stdin(ms: u32) -> bool {
-    wait_fd(STD_INPUT_HANDLE as CInt, ms)
+    wait_fd(STDIN_FD, ms)
 }
 
-pub fn close_fd(fd: CInt) {
+pub fn close_fd(fd: Fd) {
     unsafe { close(fd) };
 }
 
-pub fn wait_fd(fd: CInt, ms: u32) -> bool {
+pub fn wait_fd(fd: Fd, ms: u32) -> bool {
     let mut p = PollFd { fd, events: POLLIN, revents: 0 };
     unsafe { poll(&mut p, 1, ms.min(i32::MAX as u32) as CInt) > 0 }
 }
 
-pub fn get_termios(fd: CInt) -> Option<Termios> {
+pub fn get_termios(fd: Fd) -> Option<Termios> {
     let mut t = Termios::default();
     (unsafe { tcgetattr(fd, &mut t) } == 0).then_some(t)
 }
 
-pub fn set_termios(fd: CInt, t: &Termios) -> bool {
+pub fn set_termios(fd: Fd, t: &Termios) -> bool {
     unsafe { tcsetattr(fd, TCSANOW, t) == 0 }
 }
 
@@ -259,30 +240,137 @@ pub fn no_echo_termios(t: &mut Termios) {
     t.c_lflag &= !ECHO;
 }
 
-/// Terminal title, as an xterm OSC sequence. A no-op when stdout is not a terminal.
-pub fn set_title(t: &str) {
-    if is_console(STD_OUTPUT_HANDLE) {
-        let s = format!("\x1b]0;{}\x07", t);
-        let _ = write_fd(STD_OUTPUT_HANDLE as CInt, s.as_bytes());
-    }
+pub const SIGNALS: &[(&str, i32)] = &[
+    ("HUP", 1),
+    ("INT", 2),
+    ("QUIT", 3),
+    ("ILL", 4),
+    ("TRAP", 5),
+    ("ABRT", 6),
+    ("EMT", 7),
+    ("FPE", 8),
+    ("KILL", 9),
+    ("BUS", 10),
+    ("SEGV", 11),
+    ("SYS", 12),
+    ("PIPE", 13),
+    ("ALRM", 14),
+    ("TERM", 15),
+    ("URG", 16),
+    ("STOP", 17),
+    ("TSTP", 18),
+    ("CONT", 19),
+    ("CHLD", 20),
+    ("TTIN", 21),
+    ("TTOU", 22),
+    ("IO", 23),
+    ("XCPU", 24),
+    ("XFSZ", 25),
+    ("VTALRM", 26),
+    ("PROF", 27),
+    ("WINCH", 28),
+    ("INFO", 29),
+    ("USR1", 30),
+    ("USR2", 31),
+];
+
+pub const SIGHUP: i32 = 1;
+pub const SIGINT: i32 = 2;
+pub const SIGQUIT: i32 = 3;
+pub const SIGTERM: i32 = 15;
+pub const SIGCHLD: i32 = 20;
+pub const SIGWINCH: i32 = 28;
+
+const SIG_DFL: usize = 0;
+const SIG_IGN: usize = 1;
+
+pub fn signal_name(n: i32) -> Option<&'static str> {
+    SIGNALS.iter().find(|(_, v)| *v == n).map(|(k, _)| *k)
+}
+
+pub fn signal_number(name: &str) -> Option<i32> {
+    SIGNALS.iter().find(|(k, _)| *k == name).map(|(_, v)| *v)
 }
 
 pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static PENDING: AtomicU64 = AtomicU64::new(0);
+static INTERACTIVE: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn on_sigint(_: CInt) {
-    INTERRUPTED.store(true, Ordering::SeqCst);
-}
-
-/// Take Ctrl+C ourselves so a running command can be cut short and the shell stays alive.
-pub fn install_ctrl_handler() {
-    let act = SigAction { handler: on_sigint as *const () as usize, mask: 0, flags: 0 };
-    unsafe {
-        sigaction(SIGINT, &act, std::ptr::null_mut());
+extern "C" fn on_signal(sig: CInt) {
+    if sig == SIGINT {
+        INTERRUPTED.store(true, Ordering::SeqCst);
+    } else {
+        PENDING.fetch_or(1 << sig, Ordering::SeqCst);
     }
 }
 
-pub fn clear_ctrl_c_ignore() {
-    // Installing our own handler above already replaces an inherited SIG_IGN.
+extern "C" fn on_signal_ignored(_: CInt) {}
+
+fn set_handler(sig: i32, handler: usize) {
+    let act = SigAction { handler, mask: 0, flags: 0 };
+    unsafe {
+        sigaction(sig, &act, std::ptr::null_mut());
+    }
+}
+
+/// How a signal reaches the shell: `Catch` queues it for the interpreter, `Ignore` drops it
+/// (and children inherit that), `Default` restores the shell's own baseline for the signal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SignalMode {
+    Catch,
+    Ignore,
+    Default,
+}
+
+pub fn set_signal(sig: i32, mode: SignalMode) {
+    let interactive = INTERACTIVE.load(Ordering::SeqCst);
+    let handler = match mode {
+        SignalMode::Catch => on_signal as *const () as usize,
+        SignalMode::Ignore => SIG_IGN,
+        SignalMode::Default => match sig {
+            SIGINT | SIGHUP => on_signal as *const () as usize,
+            SIGTERM | SIGQUIT if interactive => on_signal_ignored as *const () as usize,
+            SIGTERM => on_signal as *const () as usize,
+            _ => SIG_DFL,
+        },
+    };
+    set_handler(sig, handler);
+}
+
+/// Take Ctrl+C and hangup ourselves so a running command can be cut short and the shell can
+/// leave through its normal exit path. An interactive shell also ignores the job-control
+/// stop signals, because it has no job control.
+static INTERPRETER_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+pub fn on_interpreter_thread() -> bool {
+    INTERPRETER_THREAD.get() == Some(&std::thread::current().id())
+}
+
+pub fn first_pending() -> Option<i32> {
+    let bits = PENDING.load(Ordering::SeqCst);
+    (1..64).find(|s| bits & (1 << s) != 0)
+}
+
+pub fn install_signal_handlers(interactive: bool) {
+    let _ = INTERPRETER_THREAD.set(std::thread::current().id());
+    INTERACTIVE.store(interactive, Ordering::SeqCst);
+    for sig in [SIGINT, SIGHUP, SIGTERM, SIGQUIT] {
+        if interactive || sig != SIGQUIT {
+            set_signal(sig, SignalMode::Default);
+        }
+    }
+    if interactive {
+        for sig in [18, 21, 22] {
+            set_handler(sig, SIG_IGN);
+        }
+    }
+}
+
+pub fn block_catchable_signals_here() {
+    let set = [SIGINT, SIGHUP, SIGTERM, SIGQUIT].iter().fold(0u32, |m, s| m | 1 << (s - 1));
+    unsafe {
+        pthread_sigmask(1, &set, std::ptr::null_mut());
+    }
 }
 
 pub fn take_interrupt() -> bool {
@@ -293,21 +381,44 @@ pub fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
 }
 
-/// Whether this process has a terminal on any standard stream.
-pub fn has_console() -> bool {
-    is_console(STD_INPUT_HANDLE) || is_console(STD_OUTPUT_HANDLE) || is_console(STD_ERROR_HANDLE)
+pub fn signal_pending() -> bool {
+    PENDING.load(Ordering::SeqCst) != 0
 }
 
-/// Send signal `sig` to `pid`. The exit status bash reports (128+sig) is built by the caller.
-pub fn kill_pid(pid: u32, sig: u32) -> bool {
-    unsafe { kill(pid as CInt, sig as CInt) == 0 }
+/// Signals received since the last call, in ascending order.
+pub fn take_pending() -> Vec<i32> {
+    let bits = PENDING.swap(0, Ordering::SeqCst);
+    (1..64).filter(|s| bits & (1 << s) != 0).collect()
 }
 
-pub fn pid_alive(pid: u32) -> bool {
-    if unsafe { kill(pid as CInt, 0) } == 0 {
+/// Send signal `sig` to `pid`; a negative `pid` addresses a process group.
+pub fn kill_pid(pid: i32, sig: i32) -> bool {
+    unsafe { kill(pid, sig) == 0 }
+}
+
+pub fn pid_alive(pid: i32) -> bool {
+    if unsafe { kill(pid, 0) } == 0 {
         return true;
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(1) // EPERM: exists, not ours
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+pub enum WaitOutcome {
+    Exited(i32),
+    Interrupted,
+    Failed,
+}
+
+/// Block until child `pid` ends, or until a signal wakes the wait.
+pub fn wait_pid(pid: i32) -> WaitOutcome {
+    let mut status: CInt = 0;
+    if unsafe { waitpid(pid, &mut status, 0) } == pid {
+        return WaitOutcome::Exited(status);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(4) => WaitOutcome::Interrupted,
+        _ => WaitOutcome::Failed,
+    }
 }
 
 fn rusage(who: CInt) -> (f64, f64) {
@@ -331,6 +442,26 @@ pub fn total_times() -> (f64, f64) {
     (u1 + u2, s1 + s2)
 }
 
+pub fn user_id() -> u32 {
+    unsafe { getuid() }
+}
+
+pub fn effective_user_id() -> u32 {
+    unsafe { geteuid() }
+}
+
+pub fn effective_group_id() -> u32 {
+    unsafe { getegid() }
+}
+
+pub fn parent_pid() -> u32 {
+    unsafe { getppid() as u32 }
+}
+
+unsafe fn cstr(p: *const core::ffi::c_char) -> Option<String> {
+    (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
+}
+
 pub fn user_name() -> String {
     if let Ok(u) = std::env::var("USER") {
         if !u.is_empty() {
@@ -339,11 +470,25 @@ pub fn user_name() -> String {
     }
     unsafe {
         let pw = getpwuid(getuid());
-        if !pw.is_null() && !(*pw).pw_name.is_null() {
-            return std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned();
+        if !pw.is_null() {
+            if let Some(n) = cstr((*pw).pw_name) {
+                return n;
+            }
         }
     }
     "user".into()
+}
+
+pub fn user_home(user: &str) -> Option<String> {
+    let name = CString::new(user).ok()?;
+    unsafe {
+        let pw = getpwnam(name.as_ptr());
+        if pw.is_null() {
+            None
+        } else {
+            cstr((*pw).pw_dir)
+        }
+    }
 }
 
 pub fn host_name() -> String {
@@ -356,10 +501,107 @@ pub fn host_name() -> String {
     "localhost".into()
 }
 
-// The Windows shell needed these; on Unix the terminal already handles them.
-pub fn enable_vt_output() {}
-pub fn make_append_only_stdio_writable() {}
-pub fn seek_std_append(_n: DWORD) {}
-pub fn set_utf8_console() -> Option<()> {
-    None
+/// Kernel release as `uname -r` prints it, for example `24.5.0`.
+pub fn os_release() -> String {
+    let mut u = unsafe { std::mem::zeroed::<Utsname>() };
+    if unsafe { uname(&mut u) } != 0 {
+        return String::new();
+    }
+    let end = u.release.iter().position(|&b| b == 0).unwrap_or(u.release.len());
+    String::from_utf8_lossy(&u.release[..end]).into_owned()
+}
+
+pub fn cpu_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    }
+}
+
+/// The process umask at startup. Read it before any thread starts: reading means setting it.
+pub fn startup_umask() -> u32 {
+    static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| unsafe {
+        let m = umask(0o22);
+        umask(m);
+        m
+    })
+}
+
+pub fn set_process_umask(mask: u32) {
+    unsafe {
+        umask(mask);
+    }
+}
+
+pub const R_OK: i32 = 4;
+pub const W_OK: i32 = 2;
+pub const X_OK: i32 = 1;
+
+pub fn can_access(path: &Path, mode: i32) -> bool {
+    match CString::new(path.as_os_str().as_encoded_bytes()) {
+        Ok(c) => unsafe { access(c.as_ptr(), mode) == 0 },
+        Err(_) => false,
+    }
+}
+
+pub fn make_fifo(path: &Path) -> std::io::Result<()> {
+    let c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if unsafe { mkfifo(c.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+pub const RLIM_INFINITY: u64 = i64::MAX as u64;
+pub const RLIMIT_CPU: i32 = 0;
+pub const RLIMIT_FSIZE: i32 = 1;
+pub const RLIMIT_DATA: i32 = 2;
+pub const RLIMIT_STACK: i32 = 3;
+pub const RLIMIT_CORE: i32 = 4;
+pub const RLIMIT_RSS: i32 = 5;
+pub const RLIMIT_MEMLOCK: i32 = 6;
+pub const RLIMIT_NPROC: i32 = 7;
+pub const RLIMIT_NOFILE: i32 = 8;
+
+/// (soft, hard) limit for resource `res`.
+pub fn get_rlimit(res: i32) -> Option<(u64, u64)> {
+    let mut l = RLimit { cur: 0, max: 0 };
+    (unsafe { getrlimit(res, &mut l) } == 0).then_some((l.cur, l.max))
+}
+
+/// Lowest descriptor number the process may not use, from the open-files limit.
+pub fn max_fds() -> i32 {
+    get_rlimit(RLIMIT_NOFILE).map(|(soft, _)| soft.min(i32::MAX as u64) as i32).unwrap_or(i32::MAX)
+}
+
+pub fn set_rlimit(res: i32, soft: u64, hard: u64) -> bool {
+    let l = RLimit { cur: soft, max: hard };
+    unsafe { setrlimit(res, &l) == 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::size_of;
+
+    #[test]
+    fn ffi_layouts() {
+        assert_eq!(size_of::<Termios>(), 72);
+        assert_eq!(size_of::<Winsize>(), 8);
+        assert_eq!(size_of::<Stat>(), 144);
+        assert_eq!(size_of::<Rusage>(), 144);
+        assert_eq!(size_of::<Passwd>(), 72);
+        assert_eq!(size_of::<RLimit>(), 16);
+        assert_eq!(size_of::<Utsname>(), 1280);
+    }
+
+    #[test]
+    fn signal_table_is_consistent() {
+        assert_eq!(signal_number("USR1"), Some(30));
+        assert_eq!(signal_name(20), Some("CHLD"));
+        assert!(SIGNALS.windows(2).all(|w| w[0].1 + 1 == w[1].1));
+    }
 }

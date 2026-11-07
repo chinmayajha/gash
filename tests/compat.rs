@@ -1,26 +1,24 @@
-//! Differential compatibility tests against real Git Bash.
+//! Differential compatibility tests against bash 5.2.
 //!
 //! Every `tests/scripts/*.sh` is run through the `gash` binary
 //! (`gash NNN_topic.sh`, cwd = `tests/scripts`, stdin = null) and its stdout
-//! bytes and exit code are compared with `NNN_topic.out` / `NNN_topic.code`,
-//! which were produced by `C:\Program Files\Git\bin\bash.exe` via
-//! `tests/regen_expected.ps1`. Stderr is captured for diagnostics only.
+//! bytes and exit code are compared with `NNN_topic.out` / `NNN_topic.code`.
+//! Stderr is captured for diagnostics only.
 //!
 //! All scripts are run; the test fails once at the end with a summary.
 //!
 //! Environment knobs:
 //! * `GASH_COMPAT_FILTER` - only run scripts whose file name contains this substring.
-//! * `GASH_COMPAT_JOBS`   - number of scripts run in parallel (default 1). MSYS
-//!   process creation/fork contends badly when parallel, so raising this can
-//!   cause spurious 20s timeouts (it does with real Git Bash); try it for speed.
+//! * `GASH_COMPAT_JOBS`   - number of scripts run in parallel (default 1).
 //!
-//! The child environment is normalized the same way as in `regen_expected.ps1`:
-//! `LC_ALL=C`, and `LANG`, `LC_*`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`,
-//! `CDPATH`, `GLOBIGNORE`, `POSIXLY_CORRECT` are removed.
+//! The child environment is normalized: `LC_ALL=C`, and `LANG`, `LC_*`, `BASH_ENV`, `ENV`,
+//! `SHELLOPTS`, `BASHOPTS`, `CDPATH`, `GLOBIGNORE`, `POSIXLY_CORRECT` are removed. A `wc` that
+//! prints GNU-style output (no column padding) comes first in `PATH`.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -37,17 +35,6 @@ const MAX_STDERR_LINES: usize = 10;
 const MAX_LINE_CHARS: usize = 200;
 /// Above this many lines on either side, fall back to a positional diff.
 const MAX_LCS_LINES: usize = 3000;
-
-/// Scripts that encode Git-for-Windows/MSYS behavior (path translation, `.exe`
-/// lookup, pipes that MSYS cannot reopen). They don't apply to a Unix shell.
-#[cfg(not(windows))]
-const WINDOWS_ONLY: &[&str] = &[
-    "063_heredoc_shared_stdin",
-    "064_dev_stdin",
-    "067_double_slash_switches",
-    "068_exe_suffix_file_tests",
-    "072_pathconv_env_pwd_w",
-];
 
 const REMOVED_ENV: &[&str] = &[
     "LANG",
@@ -87,7 +74,6 @@ fn compat() {
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|name| name.ends_with(".sh") && name.contains(filter.as_str()))
-        .filter(|name| cfg!(windows) || !WINDOWS_ONLY.iter().any(|w| name.starts_with(w)))
         .collect();
     scripts.sort();
     assert!(
@@ -237,7 +223,8 @@ fn run_script(exe: &Path, dir: &Path, name: &str) -> RunOutput {
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     for (key, _) in std::env::vars_os() {
         if let Some(k) = key.to_str() {
             let upper = k.to_ascii_uppercase();
@@ -247,6 +234,7 @@ fn run_script(exe: &Path, dir: &Path, name: &str) -> RunOutput {
         }
     }
     cmd.env("LC_ALL", "C");
+    cmd.env("PATH", format!("{}:{}", tool_shims().display(), std::env::var("PATH").unwrap_or_default()));
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -263,7 +251,6 @@ fn run_script(exe: &Path, dir: &Path, name: &str) -> RunOutput {
         }
     };
 
-    let job = ProcessJob::attach(&child);
     let stdout = PipeReader::start(child.stdout.take().expect("stdout is piped"));
     let stderr = PipeReader::start(child.stderr.take().expect("stderr is piped"));
 
@@ -276,7 +263,7 @@ fn run_script(exe: &Path, dir: &Path, name: &str) -> RunOutput {
         }
         if start.elapsed() >= TIMEOUT {
             timed_out = true;
-            kill_tree(&mut child, &job);
+            kill_tree(&mut child);
             break child.wait().ok();
         }
         thread::sleep(Duration::from_millis(5));
@@ -296,89 +283,30 @@ fn run_script(exe: &Path, dir: &Path, name: &str) -> RunOutput {
     }
 }
 
-/// Kills the child and everything it spawned. On Windows killing a process
-/// does not kill its children, and an orphaned grandchild (an external
-/// command, a forked subshell) would otherwise linger and keep our pipes open.
-/// The child is placed in a Job Object right after spawning (descendants
-/// inherit it even when their Windows parent has already exited, which is
-/// common with MSYS fork/exec); `taskkill /T` is a fallback.
-fn kill_tree(child: &mut std::process::Child, job: &ProcessJob) {
-    job.terminate();
-    if cfg!(windows) {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+/// Kills the child's process group, so an orphaned grandchild does not keep our pipes open.
+fn kill_tree(child: &mut std::process::Child) {
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{}", child.id())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     let _ = child.kill();
 }
 
-#[cfg(windows)]
-mod job {
-    use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-
-    type Handle = *mut c_void;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> Handle;
-        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
-        fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
-        fn CloseHandle(handle: Handle) -> i32;
-    }
-
-    pub struct ProcessJob(Handle);
-
-    impl ProcessJob {
-        pub fn attach(child: &std::process::Child) -> ProcessJob {
-            // SAFETY: plain Win32 calls; a null handle is tolerated everywhere below.
-            unsafe {
-                let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-                if !job.is_null() && AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
-                    CloseHandle(job);
-                    return ProcessJob(std::ptr::null_mut());
-                }
-                ProcessJob(job)
-            }
-        }
-
-        pub fn terminate(&self) {
-            if !self.0.is_null() {
-                // SAFETY: self.0 is a live job handle owned by this struct.
-                unsafe {
-                    TerminateJobObject(self.0, 1);
-                }
-            }
-        }
-    }
-
-    impl Drop for ProcessJob {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: closing the handle we created exactly once.
-                unsafe {
-                    CloseHandle(self.0);
-                }
-            }
-        }
-    }
+/// A directory with a `wc` that strips the column padding BSD `wc` adds.
+fn tool_shims() -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("shims");
+        fs::create_dir_all(&dir).expect("create shim directory");
+        let wc = dir.join("wc");
+        fs::write(&wc, "#!/bin/sh\n/usr/bin/wc \"$@\" | sed -E 's/^ +//; s/ +/ /g'\n").expect("write wc shim");
+        fs::set_permissions(&wc, fs::Permissions::from_mode(0o755)).expect("make wc shim executable");
+        dir
+    })
 }
-
-#[cfg(not(windows))]
-mod job {
-    pub struct ProcessJob;
-    impl ProcessJob {
-        pub fn attach(_child: &std::process::Child) -> ProcessJob {
-            ProcessJob
-        }
-        pub fn terminate(&self) {}
-    }
-}
-
-use job::ProcessJob;
 
 /// Drains a pipe on a background thread so the child never blocks on a full
 /// pipe while we poll `try_wait`; partial data is still available if the pipe

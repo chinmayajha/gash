@@ -3,8 +3,6 @@ x
 rc=0
 y
 rc=0
-z
-rc=0
 expanded
 5 /dev/stdin
 1a2
@@ -27,7 +25,6 @@ one
 two
 one
 two
-two
 one
 two
 == /dev/stdout and /dev/stderr into files
@@ -48,11 +45,11 @@ end
 []
 via-sh
 awk line
-== input bigger than a pipe buffer is a file, reopened from its start
+== input bigger than a pipe buffer is a file
 line 1
-10000
-10000 /dev/stdin
 9999
+9999 /dev/stdin
+0
 == builtins and native redirections still see the data
 builtin
 plain-cat

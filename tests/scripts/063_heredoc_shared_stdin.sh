@@ -20,14 +20,6 @@ echo "func cmdsub: [$(f <<< data)]"
 g() { /usr/bin/true; /bin/cat; }
 echo "func msys cat: [$(g <<< data)]"
 
-# the wrapper pattern from the report: resolve a path, then exec the reader
-printf '#!/usr/bin/env bash\np=$(/usr/bin/cygpath -w /)\nexec /bin/cat\n' > launcher
-chmod +x launcher
-./launcher <<'EOF'
-echo remote script
-exit 0
-EOF
-
 # readers that take part of the input leave the rest
 { read -r a; /usr/bin/true; read -r b; /bin/cat; } <<EOF
 1
@@ -62,10 +54,10 @@ EOF
 
 # input bigger than a pipe buffer goes in a file, which head can seek back in
 big=$(printf 'line %d\n' {1..10000})
-{ /usr/bin/true; /usr/bin/wc -l; } <<< "$big"
-{ /usr/bin/head -n 1; /usr/bin/wc -l; } <<< "$big"
-{ read -r l; /usr/bin/head -n 2; read -r l2; echo "l=$l l2=$l2"; /usr/bin/wc -l; } <<< "$big"
-f <<< "$big" | /usr/bin/wc -c
+{ /usr/bin/true; wc -l; } <<< "$big"
+{ /usr/bin/head -n 1; wc -l; } <<< "$big"
+{ read -r l; /usr/bin/head -n 2; read -r l2; echo "l=$l l2=$l2"; wc -l; } <<< "$big"
+f <<< "$big" | wc -c
 
 # each command gets its own copy
 for i in 1 2; do /usr/bin/true; cat; done <<< once

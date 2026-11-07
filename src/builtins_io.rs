@@ -1057,77 +1057,54 @@ pub fn mapfile(sh: &mut Shell, name: &str, args: &[String]) -> R {
 
 // ---------------- test ----------------
 
-/// The file a test operator looks at. As with Cygwin, `foo` also names `foo.exe` when only that
-/// exists, so `[ -x /usr/bin/ls ]` and `[ -x "$(command -v git)" ]` find the programs.
-fn test_path(sh: &Shell, p: &str) -> std::path::PathBuf {
-    let w = path::to_win(p, &sh.cwd);
-    if !w.exists() && !p.ends_with('/') && !p.ends_with('\\') {
-        let mut e = w.clone().into_os_string();
-        e.push(".exe");
-        let e = std::path::PathBuf::from(e);
-        if e.is_file() {
-            return e;
-        }
-    }
-    w
-}
-
 fn file_meta(sh: &Shell, p: &str) -> Option<std::fs::Metadata> {
     if p.is_empty() {
         return None;
     }
-    let md = std::fs::metadata(test_path(sh, p)).ok()?;
-    if (p.ends_with('/') || p.ends_with('\\')) && !md.is_dir() {
+    let md = std::fs::metadata(path::resolve(p, &sh.cwd)).ok()?;
+    if p.ends_with('/') && !md.is_dir() {
         return None;
     }
     Some(md)
 }
 
-fn is_executable(p: &std::path::Path, md: &std::fs::Metadata) -> bool {
-    if md.is_dir() {
-        return true;
-    }
-    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if matches!(ext.as_str(), "exe" | "com" | "bat" | "cmd" | "sh" | "dll") {
-        return true;
-    }
-    use std::io::Read;
-    if let Ok(mut f) = std::fs::File::open(p) {
-        let mut b = [0u8; 2];
-        if f.read(&mut b).unwrap_or(0) == 2 {
-            return &b == b"#!" || &b == b"MZ";
-        }
-    }
-    false
+fn can_access(sh: &Shell, p: &str, mode: i32) -> bool {
+    !p.is_empty() && crate::sys::can_access(&path::resolve(p, &sh.cwd), mode)
+}
+
+fn mode_bit(sh: &Shell, p: &str, bit: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    file_meta(sh, p).map(|m| m.permissions().mode() & bit != 0).unwrap_or(false)
+}
+
+fn file_type_is(sh: &Shell, p: &str, is: fn(&std::fs::FileType) -> bool) -> bool {
+    file_meta(sh, p).map(|m| is(&m.file_type())).unwrap_or(false)
 }
 
 pub fn test_unary(sh: &mut Shell, op: &str, s: &str) -> bool {
-    let dev = |s: &str| matches!(s, "/dev/null" | "/dev/stdin" | "/dev/stdout" | "/dev/stderr" | "/dev/tty");
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     match op {
         "-z" => s.is_empty(),
         "-n" => !s.is_empty(),
-        "-e" | "-a" => dev(s) || file_meta(sh, s).is_some(),
+        "-e" | "-a" => file_meta(sh, s).is_some(),
         "-f" => file_meta(sh, s).map(|m| m.is_file()).unwrap_or(false),
         "-d" => file_meta(sh, s).map(|m| m.is_dir()).unwrap_or(false),
         "-s" => file_meta(sh, s).map(|m| m.len() > 0 || m.is_dir()).unwrap_or(false),
-        "-r" => dev(s) || file_meta(sh, s).is_some(),
-        "-w" => dev(s) || file_meta(sh, s).map(|m| !m.permissions().readonly() || m.is_dir()).unwrap_or(false),
-        "-x" => {
-            if s.is_empty() {
-                return false;
-            }
-            let p = test_path(sh, s);
-            match std::fs::metadata(&p) {
-                Ok(m) => is_executable(&p, &m),
-                Err(_) => false,
-            }
-        }
+        "-r" => can_access(sh, s, crate::sys::R_OK),
+        "-w" => can_access(sh, s, crate::sys::W_OK),
+        "-x" => can_access(sh, s, crate::sys::X_OK),
         "-L" | "-h" => {
-            !s.is_empty() && std::fs::symlink_metadata(path::to_win(s, &sh.cwd)).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+            !s.is_empty() && std::fs::symlink_metadata(path::resolve(s, &sh.cwd)).map(|m| m.file_type().is_symlink()).unwrap_or(false)
         }
-        "-c" => dev(s),
-        "-b" | "-p" | "-S" | "-g" | "-u" | "-k" => false,
-        "-O" | "-G" => file_meta(sh, s).is_some(),
+        "-c" => file_type_is(sh, s, FileTypeExt::is_char_device),
+        "-b" => file_type_is(sh, s, FileTypeExt::is_block_device),
+        "-p" => file_type_is(sh, s, FileTypeExt::is_fifo),
+        "-S" => file_type_is(sh, s, FileTypeExt::is_socket),
+        "-g" => mode_bit(sh, s, 0o2000),
+        "-u" => mode_bit(sh, s, 0o4000),
+        "-k" => mode_bit(sh, s, 0o1000),
+        "-O" => file_meta(sh, s).map(|m| m.uid() == crate::sys::effective_user_id()).unwrap_or(false),
+        "-G" => file_meta(sh, s).map(|m| m.gid() == crate::sys::effective_group_id()).unwrap_or(false),
         "-N" => file_meta(sh, s)
             .map(|m| match (m.modified(), m.accessed()) {
                 (Ok(a), Ok(b)) => a > b,
@@ -1210,8 +1187,8 @@ pub fn test_binary(sh: &mut Shell, a: &str, op: &str, b: &str, arith: bool) -> R
             _ => false,
         },
         "-ef" => {
-            let pa = std::fs::canonicalize(path::to_win(a, &sh.cwd));
-            let pb = std::fs::canonicalize(path::to_win(b, &sh.cwd));
+            let pa = std::fs::canonicalize(path::resolve(a, &sh.cwd));
+            let pb = std::fs::canonicalize(path::resolve(b, &sh.cwd));
             match (pa, pb) {
                 (Ok(x), Ok(y)) => x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
                 _ => false,

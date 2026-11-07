@@ -11,7 +11,7 @@ fn history_file(sh: &mut Shell) -> Option<std::path::PathBuf> {
     if hf.is_empty() {
         return None;
     }
-    Some(path::to_win(&hf, &sh.cwd))
+    Some(path::resolve(&hf, &sh.cwd))
 }
 
 fn load_history(sh: &mut Shell, ed: &mut LineEditor) {
@@ -215,7 +215,7 @@ pub fn repl(sh: &mut Shell) -> i32 {
         crate::sys::take_interrupt();
         report_jobs(sh);
         if sh.sh[sho::checkwinsize()] {
-            if let Some((cols, lines)) = crate::sys::console_size() {
+            if let Some((cols, lines)) = crate::sys::terminal_size() {
                 let _ = sh.set_var("COLUMNS", &cols.to_string(), false);
                 let _ = sh.set_var("LINES", &lines.to_string(), false);
             }
@@ -238,6 +238,15 @@ pub fn repl(sh: &mut Shell) -> i32 {
             };
             match res {
                 ReadResult::Eof => {
+                    if crate::sys::signal_pending() {
+                        match sh.check_int() {
+                            Err(Flow::Exit(s)) => {
+                                exit_status = s;
+                                break 'outer;
+                            }
+                            _ => continue 'outer,
+                        }
+                    }
                     if !first {
                         // unexpected EOF in continuation
                         sh.eprint("syntax error: unexpected end of file");
@@ -499,7 +508,7 @@ pub fn command_names(sh: &mut Shell, prefix: &str) -> Vec<String> {
         if d.is_empty() {
             continue;
         }
-        let wd = path::to_win(&d, &sh.cwd);
+        let wd = path::resolve(&d, &sh.cwd);
         let rd = match std::fs::read_dir(&wd) {
             Ok(r) => r,
             Err(_) => continue,
@@ -538,14 +547,12 @@ fn file_cands(sh: &mut Shell, word: &str, dirs_only: bool, exec_only: bool) -> V
     } else {
         dir_part.to_string()
     };
-    let wd = if lookup_dir.is_empty() { sh.cwd.clone() } else { path::to_win(&lookup_dir, &sh.cwd) };
+    let wd = if lookup_dir.is_empty() { sh.cwd.clone() } else { path::resolve(&lookup_dir, &sh.cwd) };
     let mut out = Vec::new();
-    // virtual root: offer drive letters for "/"
-    let bl = base.to_lowercase();
     if let Ok(rd) = std::fs::read_dir(&wd) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if !name.to_lowercase().starts_with(&bl) {
+            if !name.starts_with(base) {
                 continue;
             }
             if name.starts_with('.') && !base.starts_with('.') {
@@ -645,7 +652,6 @@ pub fn complete(sh: &mut Shell, line: &str, pos: usize) -> Completion {
     }
     Completion { start, candidates: cands }
 }
-
 
 #[cfg(test)]
 mod tests {

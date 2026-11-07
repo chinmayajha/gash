@@ -1,4 +1,4 @@
-# MSYS programs writing to a file opened with >> (issue #1: their writes failed
+# Programs writing to a file opened with >> (issue #1: their writes failed
 # with "Bad file descriptor", or were lost silently, because the file handle
 # was append-only)
 d=$(mktemp -d)
@@ -18,13 +18,13 @@ t '/bin/ls /nonexistent 2>> f'
 # stdout and stderr to the same file must not overwrite each other
 t '/bin/sh -c "echo O1; echo E1 >&2; echo O2" >> f 2>&1'
 t '/bin/sh -c "echo O1; echo E1 >&2; echo O2" &>> f'
-# an MSYS program started by a native one (as in a git hook or alias)
+# a program started by a native one (as in a git hook or alias)
 t 'git -c alias.z="!sed s/a/b/ in.txt" z >> f'
-# an MSYS interpreter from a #! line
+# an interpreter from a #! line
 printf '#!/usr/bin/awk -f\nBEGIN { print "awk-script" }\n' > s.awk
 chmod +x s.awk
 t './s.awk >> f'
-# appending keeps what is there, and builtin and MSYS writes land in order
+# appending keeps what is there, and builtin and program writes land in order
 echo start > g
 { echo a; /bin/echo b; echo c; /usr/bin/printf 'd\n'; } >> g
 /bin/echo e >> g; echo f >> g
@@ -35,6 +35,6 @@ rm -f p
 ( exec >> p 2>&1
   { /bin/echo pipe-1; /bin/ls /nonexistent; /bin/echo pipe-2; } | /bin/cat
   /bin/sh -c 'while [ ! -e go ]; do sleep 0.05; done; echo bg-late' &
-  echo builtin-1; /bin/echo msys-fg; : > go; wait; echo builtin-2 )
+  echo builtin-1; /bin/echo prog-fg; : > go; wait; echo builtin-2 )
 /bin/cat p
 cd / && rm -rf "$d"
