@@ -6,6 +6,8 @@ mod ast;
 mod builtins;
 mod builtins_io;
 mod coreutils;
+#[cfg(test)]
+mod cygwin_argv;
 mod exec;
 mod expand;
 mod interactive;

@@ -109,17 +109,20 @@ pub fn msys_quote(a: &str) -> String {
     }
     let b = a.as_bytes();
     let dos = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
-    if dos && !a.contains('"') && !a.chars().any(|c| matches!(c, ' ' | '\t' | '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '\'')) {
+    if dos && !a.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '"' | '\'' | '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')')) {
         return a.to_string();
     }
-    let mut s = String::with_capacity(a.len() + 2);
+    let mut s = String::with_capacity(a.len() + 4);
+    if dos || a.starts_with('\\') {
+        // An empty '' first stops Cygwin reading the word as a DOS path, which would skip unescaping \\ and \".
+        s.push_str("''");
+    }
     s.push('"');
     for c in a.chars() {
-        match c {
-            '"' => s.push_str("\\\""),
-            '\\' if !dos => s.push_str("\\\\"),
-            c => s.push(c),
+        if matches!(c, '"' | '\\') {
+            s.push('\\');
         }
+        s.push(c);
     }
     s.push('"');
     s
