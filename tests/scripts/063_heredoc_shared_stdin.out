@@ -3,8 +3,6 @@ script heredoc: [line one
 line two]
 func cmdsub: [data]
 func msys cat: [data]
-echo remote script
-exit 0
 3
 4
 a=1 b=2

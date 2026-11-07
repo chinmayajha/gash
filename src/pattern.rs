@@ -497,8 +497,8 @@ fn split_components(pat: &str) -> Vec<String> {
     out
 }
 
-/// Expand a glob pattern (POSIX-style, escaped). `to_win` translates a POSIX path to a Windows one.
-pub fn glob(pat: &str, opts: GlobOpts, to_win: &dyn Fn(&str) -> std::path::PathBuf) -> Vec<String> {
+/// Expand a glob pattern (POSIX-style, escaped); `resolve` maps paths against the shell directory.
+pub fn glob(pat: &str, opts: GlobOpts, resolve: &dyn Fn(&str) -> std::path::PathBuf) -> Vec<String> {
     let comps = split_components(pat);
     // Find leading literal components.
     let abs = pat.starts_with('/');
@@ -508,7 +508,6 @@ pub fn glob(pat: &str, opts: GlobOpts, to_win: &dyn Fn(&str) -> std::path::PathB
         prefix.push('/');
         idx = 1;
     }
-    // Windows drive like C:/ as first component
     while idx < comps.len() && !has_glob_chars(&comps[idx]) {
         if idx == comps.len() - 1 {
             break;
@@ -521,13 +520,13 @@ pub fn glob(pat: &str, opts: GlobOpts, to_win: &dyn Fn(&str) -> std::path::PathB
         return vec![];
     }
     let mut results: Vec<String> = Vec::new();
-    expand_from(&prefix, &comps[idx..], opts, to_win, &mut results);
+    expand_from(&prefix, &comps[idx..], opts, resolve, &mut results);
     sort_names(&mut results, opts.c_locale);
     results
 }
 
-fn list_dir(dir: &str, to_win: &dyn Fn(&str) -> std::path::PathBuf) -> Vec<(String, bool)> {
-    let p = if dir.is_empty() { to_win(".") } else { to_win(dir) };
+fn list_dir(dir: &str, resolve: &dyn Fn(&str) -> std::path::PathBuf) -> Vec<(String, bool)> {
+    let p = if dir.is_empty() { resolve(".") } else { resolve(dir) };
     let mut v = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&p) {
         for e in rd.flatten() {
@@ -539,7 +538,7 @@ fn list_dir(dir: &str, to_win: &dyn Fn(&str) -> std::path::PathBuf) -> Vec<(Stri
     v
 }
 
-fn expand_from(prefix: &str, comps: &[String], opts: GlobOpts, to_win: &dyn Fn(&str) -> std::path::PathBuf, out: &mut Vec<String>) {
+fn expand_from(prefix: &str, comps: &[String], opts: GlobOpts, resolve: &dyn Fn(&str) -> std::path::PathBuf, out: &mut Vec<String>) {
     if comps.is_empty() {
         return;
     }
@@ -548,25 +547,25 @@ fn expand_from(prefix: &str, comps: &[String], opts: GlobOpts, to_win: &dyn Fn(&
     if comp.is_empty() {
         // trailing slash: prefix must be a dir
         if last {
-            let p = to_win(prefix.trim_end_matches('/'));
+            let p = resolve(prefix.trim_end_matches('/'));
             if p.is_dir() {
                 out.push(prefix.to_string());
             }
         } else {
-            expand_from(&format!("{}/", prefix.trim_end_matches('/')), &comps[1..], opts, to_win, out);
+            expand_from(&format!("{}/", prefix.trim_end_matches('/')), &comps[1..], opts, resolve, out);
         }
         return;
     }
     if !has_glob_chars(comp) {
         let name = unescape(comp);
         let path = format!("{}{}", prefix, name);
-        let wp = to_win(&path);
+        let wp = resolve(&path);
         if last {
             if wp.exists() || std::fs::symlink_metadata(&wp).is_ok() {
                 out.push(path);
             }
         } else if wp.is_dir() {
-            expand_from(&format!("{}/", path), &comps[1..], opts, to_win, out);
+            expand_from(&format!("{}/", path), &comps[1..], opts, resolve, out);
         }
         return;
     }
@@ -578,14 +577,14 @@ fn expand_from(prefix: &str, comps: &[String], opts: GlobOpts, to_win: &dyn Fn(&
             if !prefix.is_empty() {
                 out.push(prefix.to_string());
             }
-            walk_all(prefix, opts, to_win, out, true);
+            walk_all(prefix, opts, resolve, out, true);
             return;
         }
-        expand_from(prefix, rest, opts, to_win, out);
+        expand_from(prefix, rest, opts, resolve, out);
         let mut dirs = Vec::new();
-        walk_dirs(prefix, opts, to_win, &mut dirs);
+        walk_dirs(prefix, opts, resolve, &mut dirs);
         for d in dirs {
-            expand_from(&format!("{}/", d), rest, opts, to_win, out);
+            expand_from(&format!("{}/", d), rest, opts, resolve, out);
         }
         return;
     }
@@ -593,7 +592,7 @@ fn expand_from(prefix: &str, comps: &[String], opts: GlobOpts, to_win: &dyn Fn(&
     let explicit_dot = comp.starts_with('.') || comp.starts_with("\\.");
     let dir = prefix.trim_end_matches('/');
     let dir = if dir.is_empty() && prefix == "/" { "/" } else { dir };
-    let entries = list_dir(if prefix.is_empty() { "" } else { dir }, to_win);
+    let entries = list_dir(if prefix.is_empty() { "" } else { dir }, resolve);
     for (name, is_dir) in entries {
         if name.starts_with('.') && !explicit_dot && !opts.dotglob {
             continue;
@@ -605,35 +604,35 @@ fn expand_from(prefix: &str, comps: &[String], opts: GlobOpts, to_win: &dyn Fn(&
         if last {
             out.push(path);
         } else if is_dir {
-            expand_from(&format!("{}/", path), &comps[1..], opts, to_win, out);
+            expand_from(&format!("{}/", path), &comps[1..], opts, resolve, out);
         }
     }
 }
 
-fn walk_dirs(prefix: &str, opts: GlobOpts, to_win: &dyn Fn(&str) -> std::path::PathBuf, out: &mut Vec<String>) {
+fn walk_dirs(prefix: &str, opts: GlobOpts, resolve: &dyn Fn(&str) -> std::path::PathBuf, out: &mut Vec<String>) {
     let dir = prefix.trim_end_matches('/');
-    for (name, is_dir) in list_dir(dir, to_win) {
+    for (name, is_dir) in list_dir(dir, resolve) {
         if name.starts_with('.') && !opts.dotglob {
             continue;
         }
         if is_dir {
             let path = format!("{}{}", prefix, name);
             out.push(path.clone());
-            walk_dirs(&format!("{}/", path), opts, to_win, out);
+            walk_dirs(&format!("{}/", path), opts, resolve, out);
         }
     }
 }
 
-fn walk_all(prefix: &str, opts: GlobOpts, to_win: &dyn Fn(&str) -> std::path::PathBuf, out: &mut Vec<String>, _top: bool) {
+fn walk_all(prefix: &str, opts: GlobOpts, resolve: &dyn Fn(&str) -> std::path::PathBuf, out: &mut Vec<String>, _top: bool) {
     let dir = prefix.trim_end_matches('/');
-    for (name, is_dir) in list_dir(dir, to_win) {
+    for (name, is_dir) in list_dir(dir, resolve) {
         if name.starts_with('.') && !opts.dotglob {
             continue;
         }
         let path = format!("{}{}", prefix, name);
         out.push(path.clone());
         if is_dir {
-            walk_all(&format!("{}/", path), opts, to_win, out, false);
+            walk_all(&format!("{}/", path), opts, resolve, out, false);
         }
     }
 }

@@ -2,7 +2,7 @@
 name = "gash"
 version = "0.2.0"
 edition = "2021"
-description = "A fast, native, bash-compatible shell for Windows (drop-in replacement for Git Bash)"
+description = "A fast, native, bash-compatible shell for macOS (port of gash)"
 license = "MIT"
 
 [dependencies]

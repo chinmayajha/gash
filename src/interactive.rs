@@ -11,7 +11,7 @@ fn history_file(sh: &mut Shell) -> Option<std::path::PathBuf> {
     if hf.is_empty() {
         return None;
     }
-    Some(path::to_win(&hf, &sh.cwd))
+    Some(path::resolve(&hf, &sh.cwd))
 }
 
 fn load_history(sh: &mut Shell, ed: &mut LineEditor) {
@@ -215,7 +215,7 @@ pub fn repl(sh: &mut Shell) -> i32 {
         crate::sys::take_interrupt();
         report_jobs(sh);
         if sh.sh[sho::checkwinsize()] {
-            if let Some((cols, lines)) = crate::sys::console_size() {
+            if let Some((cols, lines)) = crate::sys::terminal_size() {
                 let _ = sh.set_var("COLUMNS", &cols.to_string(), false);
                 let _ = sh.set_var("LINES", &lines.to_string(), false);
             }
@@ -238,6 +238,15 @@ pub fn repl(sh: &mut Shell) -> i32 {
             };
             match res {
                 ReadResult::Eof => {
+                    if crate::sys::signal_pending() {
+                        match sh.check_int() {
+                            Err(Flow::Exit(s)) => {
+                                exit_status = s;
+                                break 'outer;
+                            }
+                            _ => continue 'outer,
+                        }
+                    }
                     if !first {
                         // unexpected EOF in continuation
                         sh.eprint("syntax error: unexpected end of file");
@@ -491,37 +500,27 @@ fn word_bounds(line: &str, pos: usize) -> (usize, bool) {
 }
 
 pub fn command_names(sh: &mut Shell, prefix: &str) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
     let mut out: Vec<String> = Vec::new();
-    let pl = prefix.to_lowercase();
     let pathv = sh.get_str("PATH").unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
     for d in path::split_posix_list(&pathv) {
         if d.is_empty() {
             continue;
         }
-        let wd = path::to_win(&d, &sh.cwd);
+        let wd = path::resolve(&d, &sh.cwd);
         let rd = match std::fs::read_dir(&wd) {
             Ok(r) => r,
             Err(_) => continue,
         };
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if !name.to_lowercase().starts_with(&pl) {
+            if !name.starts_with(prefix) {
                 continue;
             }
-            let lower = name.to_lowercase();
-            let base = if let Some(b) = [".exe", ".com", ".bat", ".cmd"].iter().find_map(|x| lower.strip_suffix(x).map(|_| &name[..name.len() - x.len()])) {
-                b.to_string()
-            } else if !name.contains('.') || lower.ends_with(".sh") {
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(true) {
-                    continue;
-                }
-                name.clone()
-            } else {
-                continue;
-            };
-            if seen.insert(base.clone()) {
-                out.push(base);
+            let executable = e.metadata().map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false);
+            if executable && seen.insert(name.clone()) {
+                out.push(name);
             }
         }
     }
@@ -548,14 +547,12 @@ fn file_cands(sh: &mut Shell, word: &str, dirs_only: bool, exec_only: bool) -> V
     } else {
         dir_part.to_string()
     };
-    let wd = if lookup_dir.is_empty() { sh.cwd.clone() } else { path::to_win(&lookup_dir, &sh.cwd) };
+    let wd = if lookup_dir.is_empty() { sh.cwd.clone() } else { path::resolve(&lookup_dir, &sh.cwd) };
     let mut out = Vec::new();
-    // virtual root: offer drive letters for "/"
-    let bl = base.to_lowercase();
     if let Ok(rd) = std::fs::read_dir(&wd) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if !name.to_lowercase().starts_with(&bl) {
+            if !name.starts_with(base) {
                 continue;
             }
             if name.starts_with('.') && !base.starts_with('.') {
@@ -566,24 +563,16 @@ fn file_cands(sh: &mut Shell, word: &str, dirs_only: bool, exec_only: bool) -> V
                 continue;
             }
             if exec_only && !is_dir {
-                let l = name.to_lowercase();
-                if !(l.ends_with(".exe") || l.ends_with(".sh") || l.ends_with(".bat") || l.ends_with(".cmd") || !l.contains('.')) {
+                use std::os::unix::fs::PermissionsExt;
+                let executable = e.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false);
+                if !executable {
                     continue;
                 }
             }
             out.push((format!("{}{}", dir_part, name), is_dir));
         }
     }
-    if dir_part == "/" {
-        for d in b'a'..=b'z' {
-            let ds = format!("{}:\\", (d as char).to_ascii_uppercase());
-            let name = (d as char).to_string();
-            if name.starts_with(&bl) && std::path::Path::new(&ds).exists() && !out.iter().any(|(p, _)| p == &format!("/{}", name)) {
-                out.push((format!("/{}", name), true));
-            }
-        }
-    }
-    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
@@ -664,10 +653,16 @@ pub fn complete(sh: &mut Shell, line: &str, pos: usize) -> Completion {
     Completion { start, candidates: cands }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::history_entry;
+
+    #[test]
+    fn completes_builtin() {
+        let mut sh = crate::shell::Shell::new("gash");
+        let c = super::complete(&mut sh, "ec", 2);
+        assert!(c.candidates.iter().any(|x| x.display == "echo"), "{:?}", c.candidates);
+    }
     #[test]
     fn cmdhist_joining() {
         assert_eq!(history_entry("for i in 1 2; do\necho $i\ndone"), "for i in 1 2; do echo $i; done");

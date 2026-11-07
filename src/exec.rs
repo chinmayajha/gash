@@ -7,43 +7,20 @@ use crate::path;
 use crate::shell::*;
 use crate::vars::*;
 use std::collections::HashMap;
-use std::io::{Read, Seek};
-use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
 use std::process::{Command as Proc, ExitStatus, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
 pub fn exit_code(st: ExitStatus) -> i32 {
-    match st.code() {
-        Some(c) => {
-            let u = c as u32;
-            if u == 0xC000_013A {
-                130
-            } else if u == 0xC000_0005 || u == 0xC000_00FD {
-                139
-            } else if u > 255 {
-                (u & 0xff) as i32
-            } else {
-                c
-            }
-        }
-        None => 1,
+    if let Some(sig) = st.signal() {
+        return 128 + sig;
     }
-}
-
-/// Exit status of an MSYS2/Cygwin child: a process killed by a signal exits with
-/// Windows code `signal << 8` (plus 0x80 if it dumped core), which bash reports as 128+signal.
-pub fn msys_exit_code(st: ExitStatus) -> i32 {
-    if let Some(c) = st.code() {
-        let u = c as u32;
-        let sig = u >> 8;
-        if u > 255 && (u & 0x7f) == 0 && (1..65).contains(&sig) {
-            return 128 + sig as i32;
-        }
-    }
-    exit_code(st)
+    st.code().unwrap_or(1)
 }
 
 pub fn io_err_msg(e: &std::io::Error) -> String {
@@ -94,35 +71,7 @@ enum Ctl {
 }
 
 fn has_path_sep(name: &str) -> bool {
-    name.contains('/') || name.contains('\\') || path::is_windows_abs(name)
-}
-
-/// Quote an argument for an MSYS2/Cygwin program started from a native process
-/// (whose runtime re-parses the command line with globbing).
-pub fn msys_quote(a: &str) -> String {
-    let needs = a.is_empty()
-        || a.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '"' | '\'' | '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '\\'))
-        || a.starts_with('~')
-        || a.starts_with('@');
-    if !needs {
-        return a.to_string();
-    }
-    let b = a.as_bytes();
-    let dos = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
-    if dos && !a.contains('"') && !a.chars().any(|c| matches!(c, ' ' | '\t' | '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '\'')) {
-        return a.to_string();
-    }
-    let mut s = String::with_capacity(a.len() + 2);
-    s.push('"');
-    for c in a.chars() {
-        match c {
-            '"' => s.push_str("\\\""),
-            '\\' if !dos => s.push_str("\\\\"),
-            c => s.push(c),
-        }
-    }
-    s.push('"');
-    s
+    name.contains('/')
 }
 
 pub fn read_script_file(p: &Path) -> std::io::Result<String> {
@@ -308,6 +257,7 @@ impl Shell {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Flow::Exit(143));
         }
+        self.dispatch_signals()?;
         if crate::sys::interrupted() {
             if let Some(t) = self.traps.get("INT").cloned() {
                 crate::sys::take_interrupt();
@@ -321,12 +271,42 @@ impl Shell {
         Ok(())
     }
 
+    /// Run traps for signals sent from outside; an untrapped hangup or terminate ends the shell.
+    pub fn dispatch_signals(&mut self) -> Result<(), Flow> {
+        if self.is_subshell || !crate::sys::signal_pending() {
+            return Ok(());
+        }
+        for sig in crate::sys::take_pending() {
+            let Some(name) = crate::sys::signal_name(sig) else {
+                continue;
+            };
+            match self.traps.get(name).cloned() {
+                Some(a) if a.is_empty() => {}
+                Some(_) => self.run_trap(name)?,
+                None if matches!(sig, crate::sys::SIGHUP | crate::sys::SIGTERM) => return Err(Flow::Exit(128 + sig)),
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn join_interruptible(&mut self, t: std::thread::JoinHandle<i32>) -> Result<i32, Flow> {
+        let mut nap = 20;
+        while !t.is_finished() {
+            self.dispatch_signals()?;
+            std::thread::sleep(std::time::Duration::from_micros(nap));
+            nap = (nap * 2).min(5000);
+        }
+        Ok(t.join().unwrap_or(1))
+    }
+
     // ---------- lists ----------
 
     pub fn exec_list(&mut self, list: &List) -> R {
         let mut st = self.status;
         for item in list {
             self.check_int()?;
+            self.jobs.reap();
             if item.background {
                 st = self.exec_background(item)?;
             } else {
@@ -520,7 +500,10 @@ impl Shell {
             prev = r;
         }
         drop(prev);
-        let mut sts: Vec<i32> = threads.into_iter().map(|t| t.join().unwrap_or(1)).collect();
+        let mut sts = Vec::with_capacity(threads.len() + 1);
+        for t in threads {
+            sts.push(self.join_interruptible(t)?);
+        }
         if let Some(s) = last_status {
             sts.push(s);
         }
@@ -535,9 +518,8 @@ impl Shell {
 
     fn exec_background(&mut self, item: &ListItem) -> R {
         let mut sub = self.subshell_clone();
-        // bash: without job control, `cmd &` reads /dev/null unless stdin was redirected
-        // (see Shell::stdin_redir); its own `<` redirections still apply afterwards.
-        if !self.interactive && !self.stdin_redir {
+        // No job control: a background job reads /dev/null unless stdin was redirected.
+        if !self.stdin_redir {
             sub.fds.set(0, Some(Handle::Null));
         }
         let id = self.jobs.list.iter().map(|j| j.id).max().unwrap_or(0) + 1;
@@ -1270,7 +1252,7 @@ impl Shell {
         }
         let name = &argv[0];
         if has_path_sep(name) {
-            let wp = path::to_win(name, &self.cwd);
+            let wp = path::resolve(name, &self.cwd);
             if wp.is_dir() {
                 self.eprint(&format!("{}: Is a directory", name));
                 return Ok(126);
@@ -1355,93 +1337,38 @@ impl Shell {
         if has_path_sep(name) {
             return self.resolve_path_cmd(name);
         }
-        let dirs = path::split_posix_list(pathvar);
-        for d in dirs {
-            let d = if d.is_empty() { ".".to_string() } else { d };
-            let wd = path::to_win(&d, &self.cwd);
-            if let Some(r) = self.probe(&wd, name, true) {
-                return Some(prefer_native_coreutils(r));
+        for d in path::split_posix_list(pathvar) {
+            let wd = path::resolve(if d.is_empty() { "." } else { &d }, &self.cwd);
+            if let Some(r) = self.classify_file(&wd.join(name)) {
+                return Some(r);
             }
         }
         None
     }
 
     fn resolve_path_cmd(&mut self, name: &str) -> Option<Resolved> {
-        let wp = path::to_win(name, &self.cwd);
-        if let Some(r) = self.classify_file(&wp, false) {
-            return Some(r);
-        }
-        let lower = name.to_lowercase();
-        if ![".exe", ".com", ".bat", ".cmd"].iter().any(|e| lower.ends_with(e)) {
-            for ext in [".exe", ".com", ".bat", ".cmd"] {
-                let mut s = wp.clone().into_os_string();
-                s.push(ext);
-                let p = PathBuf::from(s);
-                if let Some(r) = self.classify_file(&p, false) {
-                    return Some(r);
-                }
-            }
-        }
-        None
+        let wp = path::resolve(name, &self.cwd);
+        self.classify_file(&wp)
     }
 
-    fn probe(&mut self, dir: &Path, name: &str, strict: bool) -> Option<Resolved> {
-        let lower = name.to_lowercase();
-        let has_ext = [".exe", ".com", ".bat", ".cmd"].iter().any(|e| lower.ends_with(e));
-        if !has_ext {
-            let p = dir.join(format!("{}.exe", name));
-            if p.is_file() {
-                return self.classify_file(&p, strict);
-            }
-        }
-        let p = dir.join(name);
-        if let Some(r) = self.classify_file(&p, strict) {
-            return Some(r);
-        }
-        if !has_ext {
-            for ext in [".com", ".bat", ".cmd"] {
-                let p = dir.join(format!("{}{}", name, ext));
-                if p.is_file() {
-                    return self.classify_file(&p, strict);
-                }
-            }
-        }
-        None
-    }
-
-    /// Determine how to execute a file. `strict`: require an executable marker (PATH search).
-    pub fn classify_file(&mut self, p: &Path, strict: bool) -> Option<Resolved> {
+    /// Determine how to execute a file.
+    pub fn classify_file(&mut self, p: &Path) -> Option<Resolved> {
+        use std::os::unix::fs::PermissionsExt;
         let md = std::fs::metadata(p).ok()?;
-        if !md.is_file() {
+        if !md.is_file() || md.permissions().mode() & 0o111 == 0 {
             return None;
-        }
-        let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        match ext.as_str() {
-            "exe" | "com" => {
-                if let Some(util) = crate::coreutils::get().and_then(|cu| cu.util_of(p)) {
-                    return Some(Resolved { path: p.to_path_buf(), kind: ExeKind::Coreutils, interp: None, util: Some(util), opts: Vec::new() });
-                }
-                let kind = if path::is_msys_binary(p) || is_msys_dir(p) { ExeKind::Msys } else { ExeKind::Native };
-                return Some(Resolved { path: p.to_path_buf(), kind, interp: None, util: None, opts: Vec::new() });
-            }
-            "bat" | "cmd" => return Some(Resolved { path: p.to_path_buf(), kind: ExeKind::Batch, interp: None, util: None, opts: Vec::new() }),
-            _ => {}
         }
         let mut f = std::fs::File::open(p).ok()?;
         let mut buf = [0u8; 512];
         let n = f.read(&mut buf).unwrap_or(0);
         let head = &buf[..n];
-        if head.starts_with(b"MZ") {
-            let kind = if is_msys_dir(p) { ExeKind::Msys } else { ExeKind::Native };
-            return Some(Resolved { path: p.to_path_buf(), kind, interp: None, util: None, opts: Vec::new() });
-        }
         if head.starts_with(b"#!") {
             let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
             let line = String::from_utf8_lossy(&head[2..line_end]).trim().trim_end_matches('\r').to_string();
             let mut parts = line.split_whitespace();
             let interp = parts.next().unwrap_or("").to_string();
             let rest: Vec<String> = parts.map(|s| s.to_string()).collect();
-            let base = interp.rsplit(['/', '\\']).next().unwrap_or("").trim_end_matches(".exe").to_string();
+            let base = interp.rsplit('/').next().unwrap_or("");
             // `opts`: what a shell interpreter gets as options. As on Linux, the rest of the line
             // is a single argument; after `env` it is split into words, as `env -S` does.
             let (prog, arg, opts) = if base == "env" {
@@ -1455,130 +1382,42 @@ impl Shell {
                 let arg = if rest.is_empty() { None } else { Some(rest.join(" ")) };
                 (interp.clone(), arg.clone(), arg.into_iter().collect())
             };
-            let pbase = prog.rsplit(['/', '\\']).next().unwrap_or("").trim_end_matches(".exe").to_string();
-            if matches!(pbase.as_str(), "sh" | "bash" | "dash" | "ash" | "gash") && arg.as_deref().map(|a| !a.contains("-c")).unwrap_or(true) {
-                return Some(Resolved { path: p.to_path_buf(), kind: ExeKind::Script, interp: None, util: None, opts });
+            let pbase = prog.rsplit('/').next().unwrap_or("");
+            if matches!(pbase, "sh" | "bash" | "dash" | "ash" | "gash") && arg.as_deref().map(|a| !a.contains("-c")).unwrap_or(true) {
+                return Some(Resolved { path: p.to_path_buf(), kind: ExeKind::Script, interp: None, opts });
             }
-            // locate interpreter
-            let ip = if prog.contains('/') || prog.contains('\\') {
-                let w = path::to_win(&prog, &self.cwd);
-                let found = if w.is_file() {
-                    Some(w.clone())
-                } else {
-                    let mut s = w.clone().into_os_string();
-                    s.push(".exe");
-                    let e = PathBuf::from(s);
-                    if e.is_file() {
-                        Some(e)
-                    } else {
-                        None
-                    }
-                };
-                match found {
-                    Some(f) => Some(f),
-                    None => {
-                        let pv = self.get_str("PATH").unwrap_or_default();
-                        self.find_in_path(&pbase, &pv).map(|r| r.path)
-                    }
-                }
+            let ip = if prog.contains('/') {
+                let w = path::resolve(&prog, &self.cwd);
+                w.is_file().then_some(w)
             } else {
                 let pv = self.get_str("PATH").unwrap_or_default();
                 self.find_in_path(&prog, &pv).map(|r| r.path)
             };
             let ip = ip?;
-            let ik = if path::is_msys_binary(&ip) || is_msys_dir(&ip) { ExeKind::Msys } else { ExeKind::Native };
-            return Some(Resolved { path: p.to_path_buf(), kind: ExeKind::Interp, interp: Some((ip, ik, arg)), util: None, opts: Vec::new() });
+            return Some(Resolved { path: p.to_path_buf(), kind: ExeKind::Interp, interp: Some((ip, arg)), opts: Vec::new() });
         }
-        if strict && ext != "sh" {
-            return None;
-        }
-        Some(Resolved { path: p.to_path_buf(), kind: ExeKind::Script, interp: None, util: None, opts: Vec::new() })
+        // No `#!`: an executable binary runs as is; text is run by us, as bash does when
+        // `execve` fails with ENOEXEC.
+        let kind = if head.contains(&0) { ExeKind::Native } else { ExeKind::Script };
+        Some(Resolved { path: p.to_path_buf(), kind, interp: None, opts: Vec::new() })
     }
 
     // ---------- external commands ----------
 
     pub fn run_external(&mut self, res: &Resolved, argv: &[String], assigns: &[(String, String)]) -> R {
+        let replace = self.replace_process.take();
         if res.kind == ExeKind::Script && std::env::var_os("GASH_NO_INPROC").is_none() && !self.spawn_only {
             if let Some(r) = self.run_script_inproc(res, argv, assigns) {
                 return r;
             }
         }
         let mut cmd;
-        let native;
-        let mut msys_child = false;
-        // As in Git Bash, these count where the MSYS runtime would see them: in the environment
-        // the program starts with, so when exported or given as a prefix (`MSYS_NO_PATHCONV=1 cmd`).
-        let env_var = |name: &str| -> Option<String> {
-            match assigns.iter().rev().find(|(k, _)| k == name) {
-                Some((_, v)) => Some(v.clone()),
-                None => match self.vars.get(name) {
-                    Some(v) if v.has(EXPORT) => match &v.value {
-                        Some(Value::Str(s)) => Some(s.clone()),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-            }
-        };
-        let no_conv = env_var("MSYS_NO_PATHCONV").map(|v| !v.is_empty()).unwrap_or(false);
-        let excl: Vec<String> = env_var("MSYS2_ARG_CONV_EXCL")
-            .map(|v| v.split(';').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
-            .unwrap_or_default();
-        let conv = |a: &str| -> String {
-            if no_conv || excl.iter().any(|e| e == "*" || a.starts_with(e.as_str())) {
-                a.to_string()
-            } else {
-                path::convert_arg(a).into_owned()
-            }
-        };
         match res.kind {
             ExeKind::Native => {
                 cmd = Proc::new(&res.path);
                 for a in &argv[1..] {
-                    let a = conv(a);
-                    // Quote wildcard arguments so programs that glob their own command line
-                    // (MSVC setargv, Rust `wild`) don't expand what the shell left literal.
-                    if crate::coreutils::has_glob_chars(&a) {
-                        cmd.raw_arg(crate::coreutils::msvc_quote(&a));
-                    } else {
-                        cmd.arg(a);
-                    }
+                    cmd.arg(a);
                 }
-                native = true;
-            }
-            ExeKind::Batch => {
-                cmd = Proc::new(&res.path);
-                for a in &argv[1..] {
-                    cmd.arg(conv(a));
-                }
-                native = true;
-            }
-            ExeKind::Coreutils => {
-                // Standing in for an MSYS tool: always translate MSYS paths (per-utility policy).
-                let util = res.util.unwrap_or("");
-                let policy = crate::coreutils::policy(util).unwrap_or(crate::coreutils::ArgPolicy::Files);
-                cmd = Proc::new(&res.path);
-                let is_multicall = res.path.file_stem().map(|s| s.eq_ignore_ascii_case("coreutils")).unwrap_or(false);
-                if is_multicall {
-                    cmd.raw_arg(util);
-                }
-                for a in crate::coreutils::translate_args(policy, &argv[1..]) {
-                    cmd.raw_arg(crate::coreutils::msvc_quote(&a));
-                }
-                native = true;
-            }
-            ExeKind::Msys => {
-                // Let MSYS programs see the command name as typed in argv[0] (affects their messages).
-                // Rust resolves a bare name against the child's PATH, which we set to the same search order.
-                let typed = &argv[0];
-                let fname = res.path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
-                let same = !has_path_sep(typed) && (fname == typed.to_lowercase() || fname == format!("{}.exe", typed.to_lowercase()));
-                cmd = if same && !assigns.iter().any(|(k, _)| k == "PATH") { Proc::new(typed) } else { Proc::new(&res.path) };
-                for a in &argv[1..] {
-                    cmd.raw_arg(msys_quote(a));
-                }
-                native = false;
-                msys_child = true;
             }
             ExeKind::Script => {
                 cmd = Proc::new(&crate::global().exe);
@@ -1589,77 +1428,41 @@ impl Shell {
                 for a in &argv[1..] {
                     cmd.arg(a);
                 }
-                native = false;
             }
             ExeKind::Interp => {
-                let (ip, ik, iarg) = res.interp.clone().unwrap();
+                let (ip, iarg) = res.interp.clone().unwrap();
                 cmd = Proc::new(&ip);
-                let msys = ik == ExeKind::Msys;
-                let mut args: Vec<String> = Vec::new();
                 if let Some(a) = iarg {
-                    args.push(a);
+                    cmd.arg(a);
                 }
-                args.push(if msys { path::to_posix(&res.path) } else { res.path.to_string_lossy().into_owned() });
-                args.extend(argv[1..].iter().cloned());
-                for a in &args {
-                    if msys {
-                        cmd.raw_arg(msys_quote(a));
-                    } else {
-                        cmd.arg(conv(a));
-                    }
+                cmd.arg(res.path.as_os_str());
+                for a in &argv[1..] {
+                    cmd.arg(a);
                 }
-                native = !msys;
-                msys_child = msys;
             }
         }
         cmd.current_dir(&self.cwd);
         cmd.env_clear();
-        for (k, v) in self.child_env(assigns, native) {
-            cmd.env(k, v);
+        if !replace.as_ref().is_some_and(|r| r.clear_env) {
+            for (k, v) in self.child_env(assigns) {
+                cmd.env(k, v);
+            }
         }
         let mut pumps = Vec::new();
-        // Here-doc input lent to the child as a file (see `MemReader::lend_file`).
-        let mut lent = Vec::new();
-        // `>>` handles given to the program; they stay shared while it runs (io::shared_append).
-        let mut appends = Vec::new();
+        let mut closed = Vec::new();
         for fd in 0..3 {
-            if let Some(Handle::Append(a)) = self.fds.get(fd) {
-                appends.push(a.clone());
-            }
-            if msys_child && names_std_fd(&argv[1..], fd) {
-                if let Some(Handle::Mem(m)) = self.fds.get(fd) {
-                    if let Ok(Some(f)) = m.lock().unwrap().lend_file() {
-                        if let Ok(c) = f.try_clone() {
-                            lent.push((m.clone(), f));
-                            match fd {
-                                0 => cmd.stdin(c),
-                                1 => cmd.stdout(c),
-                                _ => cmd.stderr(c),
-                            };
-                            continue;
-                        }
+            let Some(h) = self.fds.get(fd) else {
+                closed.push(fd);
+                continue;
+            };
+            let st = match h.to_stdio(fd) {
+                Ok((s, p)) => {
+                    if let Some(p) = p {
+                        pumps.push(p);
                     }
+                    s
                 }
-            }
-            let st = match self.fds.get(fd) {
-                Some(h) => match h.to_stdio(fd) {
-                    Ok((s, p)) => {
-                        if let Some(p) = p {
-                            pumps.push(p);
-                        }
-                        s
-                    }
-                    Err(_) => Stdio::null(),
-                },
-                None => {
-                    let mut oo = std::fs::OpenOptions::new();
-                    if fd == 0 {
-                        oo.write(true);
-                    } else {
-                        oo.read(true);
-                    }
-                    oo.open("NUL").map(Stdio::from).unwrap_or_else(|_| Stdio::null())
-                }
+                Err(_) => Stdio::null(),
             };
             match fd {
                 0 => cmd.stdin(st),
@@ -1667,17 +1470,39 @@ impl Shell {
                 _ => cmd.stderr(st),
             };
         }
-        let mut flags = 0;
+        if !closed.is_empty() {
+            // `<&-` really closes the descriptor in the child; inheriting it (or
+            // handing over /dev/null) would let `cat <&-` read instead of failing.
+            unsafe {
+                cmd.pre_exec(move || {
+                    for &fd in &closed {
+                        crate::sys::close_fd(fd);
+                    }
+                    Ok(())
+                });
+            }
+        }
+        if self.umask != crate::sys::startup_umask() {
+            let mask = self.umask;
+            unsafe {
+                cmd.pre_exec(move || {
+                    crate::sys::set_process_umask(mask);
+                    Ok(())
+                });
+            }
+        }
         if self.spawn_only {
-            flags |= crate::sys::CREATE_NEW_PROCESS_GROUP;
+            cmd.process_group(0);
         }
-        if !crate::sys::has_console() {
-            // No console to inherit: without this each console child pops its own window.
-            // (Ignored by GUI programs, which still open normally.)
-            flags |= crate::sys::CREATE_NO_WINDOW;
-        }
-        if flags != 0 {
-            cmd.creation_flags(flags);
+        let top_level = !self.is_subshell && self.pid == std::process::id();
+        if let (Some(rep), true) = (&replace, pumps.is_empty() && !self.spawn_only && top_level) {
+            if let Some(a0) = &rep.arg0 {
+                cmd.arg0(a0);
+            }
+            let e = cmd.exec();
+            let code = if e.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 };
+            self.eprint(&format!("{}: {}", argv[0], io_err_msg(&e)));
+            return Ok(code);
         }
         let spawned = cmd.spawn();
         drop(cmd);
@@ -1689,48 +1514,49 @@ impl Shell {
                 return Ok(code);
             }
         };
-        if !appends.is_empty() {
-            crate::io::append_started(&appends, &child);
-        }
         if self.spawn_only {
             self.spawned = Some(child);
             return Ok(0);
         }
         self.child_pid.store(child.id(), Ordering::SeqCst);
-        let st = child.wait();
+        let st = self.wait_foreground(&mut child);
         self.child_pid.store(0, Ordering::SeqCst);
-        {
-            use std::os::windows::io::AsRawHandle;
-            let (u, s) = crate::sys::handle_times(child.as_raw_handle() as _);
-            crate::sys::add_child_times(u, s);
-        }
+        let st = st?;
         for p in pumps {
             let _ = p.join();
         }
-        for (m, f) in lent {
-            m.lock().unwrap().return_file(&f);
-        }
-        let raw = st.as_ref().ok().and_then(|s| s.code()).map(|c| c as u32);
-        let died_of_sigint = raw == Some(0xC000_013A) || (!native && raw == Some(2 << 8));
+        let sigint = st.as_ref().ok().and_then(|s| s.signal()) == Some(2);
         let code = match st {
-            Ok(s) => {
-                if native {
-                    exit_code(s)
-                } else {
-                    msys_exit_code(s)
-                }
-            }
+            Ok(s) => exit_code(s),
             Err(_) => 127,
         };
-        if died_of_sigint {
-            // The child died from Ctrl+C (MSYS programs read ^C themselves, so our console
-            // handler may not have fired): behave as if we were interrupted too.
+        if sigint {
+            // The child died from Ctrl+C: behave as if we were interrupted too.
             crate::sys::INTERRUPTED.store(true, Ordering::SeqCst);
         } else if crate::sys::interrupted() {
             // the child handled Ctrl+C itself; don't abort the script
             crate::sys::take_interrupt();
         }
         Ok(code)
+    }
+
+    /// Wait for a foreground child; a signal that wakes the wait runs its trap or ends the shell.
+    fn wait_foreground(&mut self, child: &mut std::process::Child) -> Result<std::io::Result<std::process::ExitStatus>, Flow> {
+        if self.is_subshell && !crate::sys::on_interpreter_thread() {
+            return Ok(child.wait());
+        }
+        loop {
+            match crate::sys::wait_pid(child.id() as i32) {
+                crate::sys::WaitOutcome::Exited(raw) => return Ok(Ok(std::process::ExitStatus::from_raw(raw))),
+                crate::sys::WaitOutcome::Interrupted if self.is_subshell => {
+                    if let Some(sig) = crate::sys::first_pending() {
+                        return Err(Flow::Exit(128 + sig));
+                    }
+                }
+                crate::sys::WaitOutcome::Interrupted => self.dispatch_signals()?,
+                crate::sys::WaitOutcome::Failed => return Ok(child.wait()),
+            }
+        }
     }
 
     /// `None` when the options on the script's `#!` line can't be applied in-process (see
@@ -1760,7 +1586,6 @@ impl Shell {
         for (fd, old) in saved.0.into_iter().rev() {
             self.fds.set(fd, old);
         }
-        crate::io::prune_append_files();
     }
 
     fn set_fd_saved(&mut self, fd: i32, h: Option<Handle>, saved: &mut Saved, persist: bool) {
@@ -1794,28 +1619,20 @@ impl Shell {
                 return self.fds.get(fd).cloned().ok_or_else(|| std::io::Error::other("Bad file descriptor"));
             }
         }
-        let wp = if p == "/dev/tty" {
-            PathBuf::from(if read && !write { "CONIN$" } else { "CONOUT$" })
-        } else {
-            path::to_win(p, &self.cwd)
-        };
+        let wp = path::resolve(p, &self.cwd);
         let mut oo = std::fs::OpenOptions::new();
         oo.read(read);
         if write {
-            // Not `OpenOptions::append`: that gives an append-only handle, which MSYS
-            // programs can't write to (see `Handle::Append`).
-            oo.write(true).create(true);
-            if truncate && !append {
+            oo.write(true).create(true).mode(0o666 & !self.umask);
+            if append {
+                oo.append(true);
+            } else if truncate {
                 oo.truncate(true);
             }
         }
-        if p == "/dev/tty" {
-            oo.create(false);
-        }
         let f = oo.open(&wp)?;
-        if append && write && crate::sys::is_disk(std::os::windows::io::AsRawHandle::as_raw_handle(&f) as _) {
-            (&f).seek(std::io::SeekFrom::End(0))?;
-            return Ok(Handle::Append(crate::io::shared_append(f)));
+        if append && write {
+            return Ok(Handle::Append(Arc::new(f)));
         }
         Ok(Handle::File(Arc::new(f)))
     }
@@ -1831,6 +1648,10 @@ impl Shell {
             _ => 1,
         };
         let mut fd = r.fd.unwrap_or(default_fd);
+        if fd >= crate::sys::max_fds() {
+            self.eprint(&format!("{}: Bad file descriptor", fd));
+            return Err(RedirErr::Failed);
+        }
         let persist = r.fd_var.is_some();
         if let Some(var) = &r.fd_var {
             let closing = matches!(r.op, RedirOp::DupIn | RedirOp::DupOut)
@@ -1944,7 +1765,7 @@ impl Shell {
             }
             RedirOp::Out | RedirOp::Clobber => {
                 if r.op == RedirOp::Out && self.o[O_NOCLOBBER] && !target.starts_with("/dev/") {
-                    let wp = path::to_win(&target, &self.cwd);
+                    let wp = path::resolve(&target, &self.cwd);
                     if wp.is_file() {
                         self.eprint(&format!("{}: cannot overwrite existing file", target));
                         return Err(RedirErr::Failed);
@@ -1963,7 +1784,7 @@ impl Shell {
             }
             RedirOp::OutErr | RedirOp::AppendOutErr => {
                 let app = r.op == RedirOp::AppendOutErr;
-                if !app && self.o[O_NOCLOBBER] && !target.starts_with("/dev/") && path::to_win(&target, &self.cwd).is_file() {
+                if !app && self.o[O_NOCLOBBER] && !target.starts_with("/dev/") && path::resolve(&target, &self.cwd).is_file() {
                     self.eprint(&format!("{}: cannot overwrite existing file", target));
                     return Err(RedirErr::Failed);
                 }
@@ -2008,19 +1829,6 @@ impl Shell {
     }
 }
 
-/// Does an argument name file descriptor `fd` as a file (`/dev/stdin`, `/dev/fd/0`,
-/// `/proc/self/fd/0`, also inside a longer argument such as `--file=/dev/stdin` or an
-/// `sh -c` script)?
-fn names_std_fd(args: &[String], fd: i32) -> bool {
-    let std_name = ["/dev/stdin", "/dev/stdout", "/dev/stderr"][fd as usize];
-    let numbered = [format!("/dev/fd/{}", fd), format!("/proc/self/fd/{}", fd)];
-    let ends_name = |rest: &str| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
-    args.iter().any(|a| {
-        a.match_indices(std_name).any(|(i, m)| ends_name(&a[i + m.len()..]))
-            || numbered.iter().any(|n| a.match_indices(n.as_str()).any(|(i, m)| ends_name(&a[i + m.len()..])))
-    })
-}
-
 /// Applies the options on a script's `#!` line (`#!/bin/bash -e`, `#!/usr/bin/env -S bash -eu`)
 /// to the shell that runs it, with bash's command-line syntax. Returns false for anything that
 /// would make bash print something or refuse to start (an invalid option, `--version`, ...);
@@ -2035,30 +1843,6 @@ fn apply_shebang_opts(sh: &mut Shell, opts: &[String], script: &str) -> bool {
         Err(_) => false,
     }
 }
-
-/// If `r` is one of Git's MSYS tools and Microsoft Coreutils provides the same utility,
-/// resolve to the native one instead (see `coreutils.rs`).
-fn prefer_native_coreutils(r: Resolved) -> Resolved {
-    if r.kind != ExeKind::Msys {
-        return r;
-    }
-    let cu = match crate::coreutils::get() {
-        Some(cu) => cu,
-        None => return r,
-    };
-    let stem = match r.path.file_stem().and_then(|s| s.to_str()) {
-        Some(s) => s.to_ascii_lowercase(),
-        None => return r,
-    };
-    match crate::coreutils::static_name(&stem) {
-        Some(util) if path::is_msys_binary(&r.path) => {
-            Resolved { path: cu.program(util), kind: ExeKind::Coreutils, interp: None, util: Some(util), opts: Vec::new() }
-        }
-        _ => r,
-    }
-}
-
-static MSYS_DIRS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, bool>>> = std::sync::OnceLock::new();
 
 /// bash's `stdin_redirects()`: does this redirection list count as redirecting stdin?
 /// Any `<`, `<>`, here-doc or here-string does, whatever its fd; `<&N` and `<&-`
@@ -2076,19 +1860,4 @@ fn stdin_redirects(redirs: &[Redir]) -> bool {
                 _ => false,
             }
     })
-}
-
-/// Is this executable in a directory that holds an MSYS2/Cygwin runtime DLL?
-pub fn is_msys_dir(p: &Path) -> bool {
-    let dir = match p.parent() {
-        Some(d) => d.to_path_buf(),
-        None => return false,
-    };
-    let m = MSYS_DIRS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    if let Some(v) = m.lock().unwrap().get(&dir) {
-        return *v;
-    }
-    let v = dir.join("msys-2.0.dll").exists() || dir.join("cygwin1.dll").exists();
-    m.lock().unwrap().insert(dir, v);
-    v
 }

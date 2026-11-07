@@ -1,9 +1,8 @@
-//! Interactive line editor for gash (Windows console).
+//! Interactive line editor for gash (POSIX terminal).
 //!
 //! Emacs-style editing, history, reverse incremental search and tab
-//! completion on top of the raw Win32 console API.  Zero dependencies: every
-//! Win32 function and struct used here is declared in the private `ffi`
-//! module below.
+//! completion on top of termios and ANSI escape sequences.  Zero
+//! dependencies: the terminal calls live in `sys`.
 //!
 //! Rendering model: the prompt is printed once.  On every redraw only the
 //! last prompt line plus the edit buffer are repainted.  We remember the
@@ -13,17 +12,16 @@
 //! All layout math (wrapping, wide chars, pending-wrap at the last column) is
 //! done by the pure `layout` function.
 //!
-//! If stdin is not a console, `read_line` falls back to reading one line with
-//! raw byte-wise `ReadFile` so it never over-reads input meant for children.
+//! If stdin is not a terminal, `read_line` falls back to reading one line
+//! byte-wise so it never over-reads input meant for children.
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::ops::Range;
-use std::ptr::null_mut;
 
-use ffi::Handle;
+use crate::sys::{self, Fd};
 
 // ===========================================================================
 // Public API
@@ -83,10 +81,9 @@ impl LineEditor {
         }
     }
 
-    /// True if stdin is an interactive Windows console.
+    /// True if stdin is an interactive terminal.
     pub fn is_console() -> bool {
-        let h = unsafe { ffi::GetStdHandle(ffi::STD_INPUT_HANDLE) };
-        is_console_handle(h)
+        sys::is_tty(sys::STDIN_FD)
     }
 
     /// Read one line.  See the module docs for details.
@@ -98,15 +95,14 @@ impl LineEditor {
         if !Self::is_console() {
             return read_line_fallback(prompt);
         }
-        let hin = unsafe { ffi::GetStdHandle(ffi::STD_INPUT_HANDLE) };
         let Some(out) = OutputHandle::find() else {
             return read_line_fallback(prompt);
         };
-        let Some(_guard) = ModeGuard::enter(hin, out.handle) else {
+        let Some(_guard) = ModeGuard::enter(sys::STDIN_FD) else {
             return read_line_fallback(prompt);
         };
-        // Drop order: session, then _guard (restores modes), then out.
-        let mut session = Session::new(self, hin, out.handle, prompt);
+        // Drop order: session, then _guard (restores the terminal mode), then out.
+        let mut session = Session::new(self, out.handle, prompt);
         session.run(completer)
     }
 
@@ -139,351 +135,91 @@ impl LineEditor {
 }
 
 // ===========================================================================
-// Win32 FFI
+// Terminal
 // ===========================================================================
 
-mod ffi {
-    use std::ffi::c_void;
-
-    pub type Handle = *mut c_void;
-    pub type Bool = i32;
-
-    pub const STD_INPUT_HANDLE: u32 = -10i32 as u32;
-    pub const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
-    pub const STD_ERROR_HANDLE: u32 = -12i32 as u32;
-
-    // Console input modes.
-    pub const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
-    pub const ENABLE_LINE_INPUT: u32 = 0x0002;
-    pub const ENABLE_ECHO_INPUT: u32 = 0x0004;
-    pub const ENABLE_WINDOW_INPUT: u32 = 0x0008;
-    pub const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
-
-    // Console output modes.
-    pub const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
-    pub const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
-    pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
-
-    // INPUT_RECORD event types.
-    pub const KEY_EVENT: u16 = 0x0001;
-    pub const MOUSE_EVENT: u16 = 0x0002;
-    pub const WINDOW_BUFFER_SIZE_EVENT: u16 = 0x0004;
-    pub const MENU_EVENT: u16 = 0x0008;
-    pub const FOCUS_EVENT: u16 = 0x0010;
-
-    // dwControlKeyState bits.
-    pub const RIGHT_ALT_PRESSED: u32 = 0x0001;
-    pub const LEFT_ALT_PRESSED: u32 = 0x0002;
-    pub const RIGHT_CTRL_PRESSED: u32 = 0x0004;
-    pub const LEFT_CTRL_PRESSED: u32 = 0x0008;
-    pub const SHIFT_PRESSED: u32 = 0x0010;
-
-    // Virtual key codes.
-    pub const VK_BACK: u16 = 0x08;
-    pub const VK_TAB: u16 = 0x09;
-    pub const VK_RETURN: u16 = 0x0D;
-    pub const VK_MENU: u16 = 0x12;
-    pub const VK_ESCAPE: u16 = 0x1B;
-    pub const VK_PRIOR: u16 = 0x21;
-    pub const VK_NEXT: u16 = 0x22;
-    pub const VK_END: u16 = 0x23;
-    pub const VK_HOME: u16 = 0x24;
-    pub const VK_LEFT: u16 = 0x25;
-    pub const VK_UP: u16 = 0x26;
-    pub const VK_RIGHT: u16 = 0x27;
-    pub const VK_DOWN: u16 = 0x28;
-    pub const VK_DELETE: u16 = 0x2E;
-
-    // Files.
-    pub const GENERIC_READ: u32 = 0x8000_0000;
-    pub const GENERIC_WRITE: u32 = 0x4000_0000;
-    pub const FILE_SHARE_READ: u32 = 0x1;
-    pub const FILE_SHARE_WRITE: u32 = 0x2;
-    pub const OPEN_EXISTING: u32 = 3;
-    pub const FILE_TYPE_DISK: u32 = 1;
-    pub const FILE_CURRENT: u32 = 1;
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, Debug)]
-    pub struct Coord {
-        pub x: i16,
-        pub y: i16,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, Debug)]
-    pub struct SmallRect {
-        pub left: i16,
-        pub top: i16,
-        pub right: i16,
-        pub bottom: i16,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, Debug)]
-    pub struct ConsoleScreenBufferInfo {
-        pub size: Coord,
-        pub cursor_position: Coord,
-        pub attributes: u16,
-        pub window: SmallRect,
-        pub maximum_window_size: Coord,
-    }
-
-    /// KEY_EVENT_RECORD.  `u_char` is the WCHAR/CHAR union (2 bytes).
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, Debug)]
-    pub struct KeyEventRecord {
-        pub key_down: Bool,
-        pub repeat_count: u16,
-        pub virtual_key_code: u16,
-        pub virtual_scan_code: u16,
-        pub u_char: u16,
-        pub control_key_state: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, Debug)]
-    pub struct MouseEventRecord {
-        pub mouse_position: Coord,
-        pub button_state: u32,
-        pub control_key_state: u32,
-        pub event_flags: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default, Debug)]
-    pub struct WindowBufferSizeRecord {
-        pub size: Coord,
-    }
-
-    /// The INPUT_RECORD `Event` union (16 bytes, 4-byte aligned).
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub union InputEvent {
-        pub key: KeyEventRecord,
-        pub mouse: MouseEventRecord,
-        pub window_size: WindowBufferSizeRecord,
-        pub menu_command_id: u32,
-        pub focus_set: Bool,
-        pub raw: [u32; 4],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct InputRecord {
-        pub event_type: u16,
-        pub event: InputEvent,
-    }
-
-    impl InputRecord {
-        pub fn zeroed() -> Self {
-            InputRecord { event_type: 0, event: InputEvent { raw: [0; 4] } }
-        }
-
-        pub fn key(&self) -> Option<KeyEventRecord> {
-            if self.event_type == KEY_EVENT {
-                // SAFETY: event_type says the key variant is active; every bit
-                // pattern is a valid KeyEventRecord anyway.
-                Some(unsafe { self.event.key })
-            } else {
-                None
-            }
-        }
-    }
-
-    // ABI checks against the real Win32 layouts.
-    const _: () = assert!(std::mem::size_of::<KeyEventRecord>() == 16);
-    const _: () = assert!(std::mem::size_of::<MouseEventRecord>() == 16);
-    const _: () = assert!(std::mem::size_of::<InputEvent>() == 16);
-    const _: () = assert!(std::mem::size_of::<InputRecord>() == 20);
-    const _: () = assert!(std::mem::offset_of!(InputRecord, event) == 4);
-    const _: () = assert!(std::mem::offset_of!(KeyEventRecord, u_char) == 10);
-    const _: () = assert!(std::mem::offset_of!(KeyEventRecord, control_key_state) == 12);
-    const _: () = assert!(std::mem::size_of::<ConsoleScreenBufferInfo>() == 22);
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        pub fn GetStdHandle(n_std_handle: u32) -> Handle;
-        pub fn GetConsoleMode(h: Handle, mode: *mut u32) -> Bool;
-        pub fn SetConsoleMode(h: Handle, mode: u32) -> Bool;
-        pub fn ReadConsoleInputW(h: Handle, buf: *mut InputRecord, len: u32, read: *mut u32) -> Bool;
-        pub fn PeekConsoleInputW(h: Handle, buf: *mut InputRecord, len: u32, read: *mut u32) -> Bool;
-        pub fn GetNumberOfConsoleInputEvents(h: Handle, n: *mut u32) -> Bool;
-        pub fn WriteConsoleW(
-            h: Handle,
-            buf: *const u16,
-            len: u32,
-            written: *mut u32,
-            reserved: *mut c_void,
-        ) -> Bool;
-        pub fn GetConsoleScreenBufferInfo(h: Handle, info: *mut ConsoleScreenBufferInfo) -> Bool;
-        pub fn ReadFile(
-            h: Handle,
-            buf: *mut u8,
-            len: u32,
-            read: *mut u32,
-            overlapped: *mut c_void,
-        ) -> Bool;
-        pub fn GetFileType(h: Handle) -> u32;
-        pub fn SetFilePointerEx(h: Handle, distance: i64, new_pos: *mut i64, method: u32) -> Bool;
-        pub fn CreateFileW(
-            name: *const u16,
-            access: u32,
-            share: u32,
-            security: *mut c_void,
-            disposition: u32,
-            flags: u32,
-            template: Handle,
-        ) -> Handle;
-        pub fn CloseHandle(h: Handle) -> Bool;
-    }
-}
-
-fn valid_handle(h: Handle) -> bool {
-    !h.is_null() && h as isize != -1
-}
-
-fn is_console_handle(h: Handle) -> bool {
-    let mut mode = 0u32;
-    valid_handle(h) && unsafe { ffi::GetConsoleMode(h, &mut mode) } != 0
-}
-
-/// The console output handle we draw on: stdout, else stderr, else CONOUT$.
+/// Where we draw: stdout if it is a terminal, else stderr.
 struct OutputHandle {
-    handle: Handle,
-    owned: bool,
+    handle: Fd,
 }
 
 impl OutputHandle {
     fn find() -> Option<OutputHandle> {
-        for which in [ffi::STD_OUTPUT_HANDLE, ffi::STD_ERROR_HANDLE] {
-            let h = unsafe { ffi::GetStdHandle(which) };
-            if is_console_handle(h) {
-                return Some(OutputHandle { handle: h, owned: false });
+        for fd in [sys::STDOUT_FD, sys::STDERR_FD] {
+            if sys::is_tty(fd) {
+                return Some(OutputHandle { handle: fd });
             }
         }
-        let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
-        let h = unsafe {
-            ffi::CreateFileW(
-                name.as_ptr(),
-                ffi::GENERIC_READ | ffi::GENERIC_WRITE,
-                ffi::FILE_SHARE_READ | ffi::FILE_SHARE_WRITE,
-                null_mut(),
-                ffi::OPEN_EXISTING,
-                0,
-                null_mut(),
-            )
-        };
-        if !valid_handle(h) {
-            return None;
-        }
-        if !is_console_handle(h) {
-            unsafe { ffi::CloseHandle(h) };
-            return None;
-        }
-        Some(OutputHandle { handle: h, owned: true })
+        None
     }
 }
 
-impl Drop for OutputHandle {
-    fn drop(&mut self) {
-        if self.owned {
-            unsafe { ffi::CloseHandle(self.handle) };
-        }
-    }
-}
-
-/// Puts the console into raw-ish mode and restores both modes on drop
-/// (including on panic).
+/// Puts the terminal into raw mode and restores it on drop (including on panic).
 struct ModeGuard {
-    hin: Handle,
-    in_mode: u32,
-    hout: Handle,
-    out_mode: Option<u32>,
+    saved: sys::Termios,
 }
 
 impl ModeGuard {
-    fn enter(hin: Handle, hout: Handle) -> Option<ModeGuard> {
-        let mut in_mode = 0u32;
-        if unsafe { ffi::GetConsoleMode(hin, &mut in_mode) } == 0 {
+    fn enter(fd: Fd) -> Option<ModeGuard> {
+        let saved = sys::get_termios(fd)?;
+        let mut raw = saved;
+        sys::raw_termios(&mut raw);
+        if !sys::set_termios(fd, &raw) {
             return None;
         }
-        let mut om = 0u32;
-        let out_mode = if unsafe { ffi::GetConsoleMode(hout, &mut om) } != 0 { Some(om) } else { None };
-        let guard = ModeGuard { hin, in_mode, hout, out_mode };
-
-        // Keep every other bit (quick-edit / insert / extended flags / mouse)
-        // exactly as the user had it.
-        let raw = (in_mode
-            & !(ffi::ENABLE_LINE_INPUT
-                | ffi::ENABLE_ECHO_INPUT
-                | ffi::ENABLE_PROCESSED_INPUT
-                | ffi::ENABLE_VIRTUAL_TERMINAL_INPUT))
-            | ffi::ENABLE_WINDOW_INPUT;
-        unsafe { ffi::SetConsoleMode(hin, raw) };
-
-        if let Some(m) = out_mode {
-            let base = m | ffi::ENABLE_PROCESSED_OUTPUT | ffi::ENABLE_WRAP_AT_EOL_OUTPUT;
-            if unsafe { ffi::SetConsoleMode(hout, base | ffi::ENABLE_VIRTUAL_TERMINAL_PROCESSING) } == 0 {
-                unsafe { ffi::SetConsoleMode(hout, base) };
-            }
-        }
-        Some(guard)
+        Some(ModeGuard { saved })
     }
 }
 
 impl Drop for ModeGuard {
     fn drop(&mut self) {
-        unsafe {
-            ffi::SetConsoleMode(self.hin, self.in_mode);
-            if let Some(m) = self.out_mode {
-                ffi::SetConsoleMode(self.hout, m);
+        sys::set_termios(sys::STDIN_FD, &self.saved);
+    }
+}
+
+fn console_cols(h: Fd) -> usize {
+    sys::winsize(h).map(|(c, _)| c).unwrap_or(80)
+}
+
+/// Ask the terminal for the cursor column (`ESC[6n`). Bytes that arrive before the
+/// answer (type-ahead) go back into the queue.
+fn cursor_column(h: Fd, q: &mut InputQueue) -> usize {
+    if sys::write_fd(h, b"\x1b[6n") <= 0 {
+        return 0;
+    }
+    let mut seen = Vec::new();
+    while let Some(b) = q.read_byte(Some(50)) {
+        seen.push(b);
+        if b == b'R' {
+            if let Some(i) = seen.windows(2).rposition(|w| w == b"\x1b[") {
+                let resp = String::from_utf8_lossy(&seen[i + 2..seen.len() - 1]).into_owned();
+                if let Some(c) = resp.split(';').nth(1).and_then(|x| x.parse().ok()) {
+                    q.unread(&seen[..i]);
+                    return c;
+                }
             }
-        }
-    }
-}
-
-fn screen_info(h: Handle) -> Option<ffi::ConsoleScreenBufferInfo> {
-    let mut info = ffi::ConsoleScreenBufferInfo::default();
-    if unsafe { ffi::GetConsoleScreenBufferInfo(h, &mut info) } != 0 {
-        Some(info)
-    } else {
-        None
-    }
-}
-
-/// Wrap width of the console (buffer width; equals window width normally).
-fn console_cols(h: Handle) -> usize {
-    match screen_info(h) {
-        Some(i) if i.size.x > 0 => i.size.x as usize,
-        _ => 80,
-    }
-}
-
-fn cursor_column(h: Handle) -> usize {
-    screen_info(h).map(|i| i.cursor_position.x.max(0) as usize).unwrap_or(0)
-}
-
-/// Write UTF-16 to the console, in chunks that never split a surrogate pair.
-fn write_console(h: Handle, s: &str) {
-    if s.is_empty() {
-        return;
-    }
-    let w: Vec<u16> = s.encode_utf16().collect();
-    let mut i = 0;
-    while i < w.len() {
-        let mut end = (i + 16384).min(w.len());
-        if end < w.len() && (0xD800..0xDC00).contains(&w[end - 1]) {
-            end -= 1;
-        }
-        let mut written = 0u32;
-        let ok = unsafe {
-            ffi::WriteConsoleW(h, w[i..].as_ptr(), (end - i) as u32, &mut written, null_mut())
-        };
-        if ok == 0 || written == 0 {
             break;
         }
-        i += written as usize;
+        if seen.len() > 32 {
+            break;
+        }
+    }
+    q.unread(&seen);
+    0
+}
+
+fn write_console(h: Fd, s: &str) {
+    let bytes = s.as_bytes();
+    let mut off = 0;
+    while off < bytes.len() {
+        let n = sys::write_fd(h, &bytes[off..]);
+        if n <= 0 {
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        off += n as usize;
     }
 }
 
@@ -499,11 +235,7 @@ fn read_line_fallback(prompt: &str) -> ReadResult {
         let _ = e.write_all(p.as_bytes());
         let _ = e.flush();
     }
-    let h = unsafe { ffi::GetStdHandle(ffi::STD_INPUT_HANDLE) };
-    if !valid_handle(h) {
-        return ReadResult::Eof;
-    }
-    match read_raw_line(h) {
+    match read_raw_line() {
         None => ReadResult::Eof,
         Some(mut bytes) => {
             if bytes.last() == Some(&b'\r') {
@@ -517,51 +249,26 @@ fn read_line_fallback(prompt: &str) -> ReadResult {
     }
 }
 
-/// Read up to (not including) the next '\n' with raw `ReadFile`, never
-/// consuming input past the newline: byte-by-byte for pipes/consoles; for
-/// seekable disk files read a chunk and seek back (like bash does).
-/// Returns `None` on EOF with nothing read.
-fn read_raw_line(h: Handle) -> Option<Vec<u8>> {
+/// Read up to (not including) the next '\n', one byte at a time, never consuming
+/// input past the newline: it may be meant for a child.
+fn read_raw_line() -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    let seekable = unsafe {
-        let mut pos = 0i64;
-        ffi::GetFileType(h) == ffi::FILE_TYPE_DISK
-            && ffi::SetFilePointerEx(h, 0, &mut pos, ffi::FILE_CURRENT) != 0
-    };
-    if seekable {
-        let mut chunk = [0u8; 4096];
-        loop {
-            let mut n = 0u32;
-            let ok = unsafe {
-                ffi::ReadFile(h, chunk.as_mut_ptr(), chunk.len() as u32, &mut n, null_mut())
-            };
-            if ok == 0 || n == 0 {
-                break;
-            }
-            let data = &chunk[..n as usize];
-            if let Some(i) = data.iter().position(|&b| b == b'\n') {
-                out.extend_from_slice(&data[..i]);
-                let back = (data.len() - (i + 1)) as i64;
-                if back > 0 {
-                    unsafe { ffi::SetFilePointerEx(h, -back, null_mut(), ffi::FILE_CURRENT) };
-                }
-                return Some(out);
-            }
-            out.extend_from_slice(data);
+    let mut b = 0u8;
+    loop {
+        let n = sys::read_fd(sys::STDIN_FD, std::slice::from_mut(&mut b));
+        if n == 0 {
+            break;
         }
-    } else {
-        loop {
-            let mut b = 0u8;
-            let mut n = 0u32;
-            let ok = unsafe { ffi::ReadFile(h, &mut b, 1, &mut n, null_mut()) };
-            if ok == 0 || n == 0 {
-                break;
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
-            if b == b'\n' {
-                return Some(out);
-            }
-            out.push(b);
+            break;
         }
+        if b == b'\n' {
+            return Some(out);
+        }
+        out.push(b);
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -1172,6 +879,8 @@ fn format_columns(items: &[String], cols: usize) -> String {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Key {
+    /// A sequence we don't bind (mouse reports, function keys...).
+    Ignore,
     Char(char),
     Ctrl(char),
     Alt(char),
@@ -1194,163 +903,139 @@ enum Key {
     PageDown,
 }
 
-/// Decode a key-down: virtual key, character (already surrogate-combined,
-/// 0 if none) and dwControlKeyState.
-fn decode_key(vk: u16, ch: u32, state: u32) -> Option<Key> {
-    let ctrl = state & (ffi::LEFT_CTRL_PRESSED | ffi::RIGHT_CTRL_PRESSED) != 0;
-    let alt = state & (ffi::LEFT_ALT_PRESSED | ffi::RIGHT_ALT_PRESSED) != 0;
-    let special = match vk {
-        ffi::VK_LEFT => Some(if ctrl || alt { Key::WordLeft } else { Key::Left }),
-        ffi::VK_RIGHT => Some(if ctrl || alt { Key::WordRight } else { Key::Right }),
-        ffi::VK_UP => Some(Key::Up),
-        ffi::VK_DOWN => Some(Key::Down),
-        ffi::VK_HOME => Some(Key::Home),
-        ffi::VK_END => Some(Key::End),
-        ffi::VK_PRIOR => Some(Key::PageUp),
-        ffi::VK_NEXT => Some(Key::PageDown),
-        ffi::VK_DELETE => Some(if ctrl || alt { Key::CtrlDelete } else { Key::Delete }),
-        ffi::VK_BACK => Some(if ctrl || alt { Key::AltBackspace } else { Key::Backspace }),
-        ffi::VK_RETURN => Some(Key::Enter),
-        ffi::VK_ESCAPE => Some(Key::Esc),
-        ffi::VK_TAB => {
-            if ctrl || alt {
-                return None;
-            }
-            Some(Key::Tab)
-        }
-        _ => None,
-    };
-    if special.is_some() {
-        return special;
-    }
-    if ch == 0 {
-        return None;
-    }
-    let c = char::from_u32(ch)?;
-    let printable = ch >= 0x20 && ch != 0x7F && !(0x80..0xA0).contains(&ch);
-    if printable {
-        // Ctrl+Alt with a real character is AltGr: insert it.
-        if alt && !ctrl {
-            return Some(Key::Alt(c));
-        }
-        return Some(Key::Char(c));
-    }
-    match ch {
-        0x08 | 0x7F => Some(Key::Backspace),
-        0x09 => Some(Key::Tab),
-        0x0A | 0x0D => Some(Key::Enter),
-        0x1B => Some(Key::Esc),
-        0x01..=0x1A => Some(Key::Ctrl((b'a' + ch as u8 - 1) as char)),
-        0x1C..=0x1F => Some(Key::Ctrl((ch as u8 + 0x40) as char)),
-        _ => None,
-    }
-}
-
-fn is_high_surrogate(u: u16) -> bool {
-    (0xD800..0xDC00).contains(&u)
-}
-
-fn is_low_surrogate(u: u16) -> bool {
-    (0xDC00..0xE000).contains(&u)
-}
-
 // ===========================================================================
 // Input queue
 // ===========================================================================
 
-const PEEK_MAX: usize = 512;
-
-/// Console input reader that batches reads but never consumes records past
-/// one that may end the line (Enter, Ctrl+C, Ctrl+D), so type-ahead and
-/// pasted text after a newline stay queued for whoever reads next.
+/// Terminal input reader. Bytes are consumed one at a time, so nothing past the
+/// key that ends a line is taken from the terminal: it stays queued for a child.
 struct InputQueue {
-    h: Handle,
-    buf: Vec<ffi::InputRecord>,
-    pos: usize,
-    peek: Vec<ffi::InputRecord>,
-}
-
-fn may_end_line(r: &ffi::InputRecord) -> bool {
-    match r.key() {
-        Some(k) => {
-            k.key_down != 0
-                && (k.virtual_key_code == ffi::VK_RETURN
-                    || matches!(k.u_char, 0x03 | 0x04 | 0x0A | 0x0D))
-        }
-        None => false,
-    }
+    fd: Fd,
+    pending: VecDeque<u8>,
 }
 
 impl InputQueue {
-    fn new(h: Handle) -> Self {
-        InputQueue { h, buf: Vec::new(), pos: 0, peek: Vec::new() }
+    fn new(fd: Fd) -> Self {
+        InputQueue { fd, pending: VecDeque::new() }
     }
 
-    fn console_count(&self) -> u32 {
-        let mut n = 0u32;
-        if unsafe { ffi::GetNumberOfConsoleInputEvents(self.h, &mut n) } == 0 {
-            0
-        } else {
-            n
+    fn unread(&mut self, bytes: &[u8]) {
+        for &b in bytes.iter().rev() {
+            self.pending.push_front(b);
         }
     }
 
     /// More input is available without blocking.
     fn has_pending(&self) -> bool {
-        self.pos < self.buf.len() || self.console_count() > 0
+        !self.pending.is_empty() || sys::wait_fd(self.fd, 0)
     }
 
-    /// Next input record, blocking if necessary.  `None` on console error.
-    fn next(&mut self) -> Option<ffi::InputRecord> {
-        if self.pos < self.buf.len() {
-            let r = self.buf[self.pos];
-            self.pos += 1;
-            return Some(r);
+    /// Next byte, blocking unless `timeout` is given (milliseconds).
+    fn read_byte(&mut self, timeout: Option<u32>) -> Option<u8> {
+        if let Some(b) = self.pending.pop_front() {
+            return Some(b);
         }
-        self.buf.clear();
-        self.pos = 0;
-        if self.console_count() > 0 {
-            self.peek.resize(PEEK_MAX, ffi::InputRecord::zeroed());
-            let mut got = 0u32;
-            let ok = unsafe {
-                ffi::PeekConsoleInputW(self.h, self.peek.as_mut_ptr(), PEEK_MAX as u32, &mut got)
-            };
-            let got = if ok != 0 { (got as usize).min(PEEK_MAX) } else { 0 };
-            if got > 0 {
-                let take = self.peek[..got].iter().position(may_end_line).map_or(got, |i| i + 1);
-                self.buf.resize(take, ffi::InputRecord::zeroed());
-                let mut done = 0usize;
-                while done < take {
-                    let mut n = 0u32;
-                    let ok = unsafe {
-                        ffi::ReadConsoleInputW(
-                            self.h,
-                            self.buf.as_mut_ptr().add(done),
-                            (take - done) as u32,
-                            &mut n,
-                        )
-                    };
-                    if ok == 0 || n == 0 {
-                        break;
-                    }
-                    done += n as usize;
-                }
-                self.buf.truncate(done);
-                if done > 0 {
-                    self.pos = 1;
-                    return Some(self.buf[0]);
-                }
-            }
-        }
-        loop {
-            let mut rec = ffi::InputRecord::zeroed();
-            let mut n = 0u32;
-            if unsafe { ffi::ReadConsoleInputW(self.h, &mut rec, 1, &mut n) } == 0 {
+        if let Some(ms) = timeout {
+            if !sys::wait_fd(self.fd, ms) {
                 return None;
             }
+        }
+        let mut b = 0u8;
+        loop {
+            let n = sys::read_fd(self.fd, std::slice::from_mut(&mut b));
             if n == 1 {
-                return Some(rec);
+                return Some(b);
             }
+            if n == 0 {
+                return None;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted || sys::signal_pending() {
+                return None;
+            }
+        }
+    }
+
+    /// Next key, blocking. `None` on end of input.
+    fn next_key(&mut self) -> Option<Key> {
+        let b = self.read_byte(None)?;
+        Some(self.decode(b))
+    }
+
+    fn decode(&mut self, b: u8) -> Key {
+        match b {
+            0x1b => {
+                let Some(b2) = self.read_byte(Some(20)) else {
+                    return Key::Esc;
+                };
+                match b2 {
+                    b'[' | b'O' => self.decode_csi(),
+                    0x7f | 0x08 => Key::AltBackspace,
+                    _ if b2 < 0x80 => Key::Alt(b2 as char),
+                    _ => self.utf8_char(b2),
+                }
+            }
+            0x7f | 0x08 => Key::Backspace,
+            b'\r' | b'\n' => Key::Enter,
+            b'\t' => Key::Tab,
+            0x01..=0x1a => Key::Ctrl((b'a' + b - 1) as char),
+            0x1c..=0x1f => Key::Ctrl((b + 0x40) as char),
+            b if b < 0x80 => Key::Char(b as char),
+            b => self.utf8_char(b),
+        }
+    }
+
+    fn decode_csi(&mut self) -> Key {
+        let mut seq = String::new();
+        let mut fin = 0u8;
+        for _ in 0..16 {
+            let Some(b) = self.read_byte(Some(20)) else {
+                return Key::Esc;
+            };
+            if (0x40..=0x7e).contains(&b) {
+                fin = b;
+                break;
+            }
+            seq.push(b as char);
+        }
+        let nums: Vec<u32> = seq.split(';').filter_map(|s| s.parse().ok()).collect();
+        let ctrl = matches!(nums.get(1), Some(5 | 6));
+        let alt = matches!(nums.get(1), Some(3 | 4));
+        match fin {
+            b'A' => Key::Up,
+            b'B' => Key::Down,
+            b'C' => if ctrl || alt { Key::WordRight } else { Key::Right },
+            b'D' => if ctrl || alt { Key::WordLeft } else { Key::Left },
+            b'H' => Key::Home,
+            b'F' => Key::End,
+            b'~' => match nums.first().copied().unwrap_or(0) {
+                1 | 7 => Key::Home,
+                3 => if ctrl || alt { Key::CtrlDelete } else { Key::Delete },
+                4 | 8 => Key::End,
+                5 => Key::PageUp,
+                6 => Key::PageDown,
+                _ => Key::Ignore,
+            },
+            _ => Key::Ignore,
+        }
+    }
+
+    fn utf8_char(&mut self, first: u8) -> Key {
+        let len = match first {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return Key::Ignore,
+        };
+        let mut bytes = vec![first];
+        for _ in 1..len {
+            let Some(b) = self.read_byte(Some(20)) else {
+                return Key::Ignore;
+            };
+            bytes.push(b);
+        }
+        match std::str::from_utf8(&bytes).ok().and_then(|s| s.chars().next()) {
+            Some(c) => Key::Char(c),
+            None => Key::Ignore,
         }
     }
 }
@@ -1358,12 +1043,6 @@ impl InputQueue {
 // ===========================================================================
 // Interactive session
 // ===========================================================================
-
-enum Event {
-    Key(Key, u16),
-    Resize,
-    Nothing,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LastCmd {
@@ -1403,9 +1082,8 @@ struct YankArg {
 
 struct Session<'a> {
     le: &'a mut LineEditor,
-    hout: Handle,
+    hout: Fd,
     queue: InputQueue,
-    high_surrogate: Option<u16>,
     prompt: Prompt,
 
     buf: String,
@@ -1433,13 +1111,12 @@ struct Session<'a> {
 type Completer<'c> = dyn FnMut(&str, usize) -> Completion + 'c;
 
 impl<'a> Session<'a> {
-    fn new(le: &'a mut LineEditor, hin: Handle, hout: Handle, prompt: &str) -> Self {
+    fn new(le: &'a mut LineEditor, hout: Fd, prompt: &str) -> Self {
         let hist_idx = le.history.len();
         Session {
             le,
             hout,
-            queue: InputQueue::new(hin),
-            high_surrogate: None,
+            queue: InputQueue::new(sys::STDIN_FD),
             prompt: parse_prompt(prompt),
             buf: String::new(),
             cursor: 0,
@@ -1464,7 +1141,7 @@ impl<'a> Session<'a> {
         // A single-line prompt continues wherever the cursor is (bash prints
         // `foo$ ` after output lacking a newline); a multi-line prompt's last
         // line always starts at column 0.
-        self.start_col = if self.prompt.head.is_empty() { cursor_column(self.hout) } else { 0 };
+        self.start_col = if self.prompt.head.is_empty() { cursor_column(self.hout, &mut self.queue) } else { 0 };
         let head = self.prompt.head.clone();
         self.refresh_with(&head);
         loop {
@@ -1473,69 +1150,16 @@ impl<'a> Session<'a> {
             if self.dirty && !self.queue.has_pending() {
                 self.refresh();
             }
-            let Some(ev) = self.next_event() else {
+            let Some(key) = self.queue.next_key() else {
                 return ReadResult::Eof;
             };
-            match ev {
-                Event::Nothing => {}
-                Event::Resize => self.dirty = true,
-                Event::Key(key, repeat) => {
-                    for _ in 0..repeat.max(1) {
-                        if let Some(r) = self.handle_key(key, completer) {
-                            if self.dirty {
-                                self.refresh();
-                            }
-                            return r;
-                        }
-                    }
+            if let Some(r) = self.handle_key(key, completer) {
+                if self.dirty {
+                    self.refresh();
                 }
+                return r;
             }
         }
-    }
-
-    // ----- input ---------------------------------------------------------
-
-    /// Consume one input record.  `None` only on console read failure.
-    fn next_event(&mut self) -> Option<Event> {
-        let rec = self.queue.next()?;
-        match rec.event_type {
-            ffi::KEY_EVENT => {
-                let k = rec.key()?;
-                Some(self.decode_record(&k).unwrap_or(Event::Nothing))
-            }
-            ffi::WINDOW_BUFFER_SIZE_EVENT => Some(Event::Resize),
-            _ => Some(Event::Nothing),
-        }
-    }
-
-    fn decode_record(&mut self, k: &ffi::KeyEventRecord) -> Option<Event> {
-        let down = k.key_down != 0;
-        let unit = k.u_char;
-        // Alt+numpad entry delivers the char on the Alt key-up.
-        let alt_numpad = !down && k.virtual_key_code == ffi::VK_MENU && unit != 0;
-        // Some hosts deliver the low surrogate on a key-up.
-        let completes_pair = self.high_surrogate.is_some() && is_low_surrogate(unit);
-        if !down && !alt_numpad && !completes_pair {
-            return None;
-        }
-        let ch: u32 = if is_high_surrogate(unit) {
-            self.high_surrogate = Some(unit);
-            return None;
-        } else if is_low_surrogate(unit) {
-            let h = self.high_surrogate.take()?;
-            0x10000 + (((h as u32) - 0xD800) << 10) + ((unit as u32) - 0xDC00)
-        } else {
-            self.high_surrogate = None;
-            unit as u32
-        };
-        let (vk, state) = if alt_numpad || (completes_pair && !down) {
-            (0, 0)
-        } else {
-            (k.virtual_key_code, k.control_key_state)
-        };
-        let key = decode_key(vk, ch, state)?;
-        let repeat = if down { k.repeat_count.max(1) } else { 1 };
-        Some(Event::Key(key, repeat))
     }
 
     // ----- output --------------------------------------------------------
@@ -2044,18 +1668,11 @@ impl<'a> Session<'a> {
 
     fn ask_yes_no(&mut self) -> bool {
         loop {
-            match self.next_event() {
+            match self.queue.next_key() {
                 None => return false,
-                Some(Event::Key(k, _)) => match k {
-                    Key::Char('y' | 'Y' | ' ') => return true,
-                    Key::Char('n' | 'N')
-                    | Key::Esc
-                    | Key::Backspace
-                    | Key::Ctrl('g')
-                    | Key::Ctrl('c') => return false,
-                    _ => self.beep(),
-                },
-                Some(_) => {}
+                Some(Key::Char('y' | 'Y' | ' ')) => return true,
+                Some(Key::Char('n' | 'N') | Key::Esc | Key::Backspace | Key::Ctrl('g') | Key::Ctrl('c')) => return false,
+                Some(_) => self.beep(),
             }
         }
     }
@@ -2071,17 +1688,6 @@ mod tests {
 
     fn ws(n: usize) -> Vec<Glyph> {
         vec![Glyph::W(1); n]
-    }
-
-    #[test]
-    fn ffi_layouts() {
-        assert_eq!(std::mem::size_of::<ffi::InputRecord>(), 20);
-        assert_eq!(std::mem::align_of::<ffi::InputRecord>(), 4);
-        assert_eq!(std::mem::size_of::<ffi::KeyEventRecord>(), 16);
-        assert_eq!(std::mem::offset_of!(ffi::KeyEventRecord, repeat_count), 4);
-        assert_eq!(std::mem::offset_of!(ffi::KeyEventRecord, virtual_key_code), 6);
-        assert_eq!(std::mem::offset_of!(ffi::KeyEventRecord, virtual_scan_code), 8);
-        assert_eq!(std::mem::size_of::<ffi::ConsoleScreenBufferInfo>(), 22);
     }
 
     #[test]
@@ -2263,24 +1869,31 @@ mod tests {
 
     #[test]
     fn keys() {
-        use ffi::*;
-        // AltGr (LeftCtrl + RightAlt) producing '@' inserts it.
-        assert_eq!(decode_key(0x51, '@' as u32, LEFT_CTRL_PRESSED | RIGHT_ALT_PRESSED), Some(Key::Char('@')));
-        assert_eq!(decode_key(0x41, 0x01, LEFT_CTRL_PRESSED), Some(Key::Ctrl('a')));
-        assert_eq!(decode_key(0x48, 0x08, LEFT_CTRL_PRESSED), Some(Key::Backspace));
-        assert_eq!(decode_key(0x42, 'b' as u32, LEFT_ALT_PRESSED), Some(Key::Alt('b')));
-        assert_eq!(decode_key(0xBE, '.' as u32, LEFT_ALT_PRESSED), Some(Key::Alt('.')));
-        assert_eq!(decode_key(VK_LEFT, 0, LEFT_CTRL_PRESSED), Some(Key::WordLeft));
-        assert_eq!(decode_key(VK_LEFT, 0, 0), Some(Key::Left));
-        assert_eq!(decode_key(VK_BACK, 0x08, LEFT_ALT_PRESSED), Some(Key::AltBackspace));
-        assert_eq!(decode_key(VK_BACK, 0x7F, LEFT_CTRL_PRESSED), Some(Key::AltBackspace));
-        assert_eq!(decode_key(VK_RETURN, 0x0D, 0), Some(Key::Enter));
-        assert_eq!(decode_key(VK_RETURN, 0x0A, LEFT_CTRL_PRESSED), Some(Key::Enter));
-        assert_eq!(decode_key(VK_ESCAPE, 0x1B, 0), Some(Key::Esc));
-        assert_eq!(decode_key(0x10, 0, SHIFT_PRESSED), None); // bare Shift
-        assert_eq!(decode_key(0, 0x1F600, 0), Some(Key::Char('😀')));
-        assert_eq!(decode_key(0x43, 0x03, LEFT_CTRL_PRESSED), Some(Key::Ctrl('c')));
-        assert_eq!(decode_key(0xBD, 0x1F, LEFT_CTRL_PRESSED), Some(Key::Ctrl('_')));
+        use std::io::Write;
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"a\x01\x7f\x1b[D\x1b[1;5C\x1b[3~\x1b[1;3D\r\x1bb\x1b[Z\xc3\xa9").unwrap();
+        drop(w);
+        let mut q = InputQueue::new(std::os::fd::AsRawFd::as_raw_fd(&r));
+        let mut got = Vec::new();
+        while let Some(k) = q.next_key() {
+            got.push(k);
+        }
+        assert_eq!(
+            got,
+            vec![
+                Key::Char('a'),
+                Key::Ctrl('a'),
+                Key::Backspace,
+                Key::Left,
+                Key::WordRight,
+                Key::Delete,
+                Key::WordLeft,
+                Key::Enter,
+                Key::Alt('b'),
+                Key::Ignore,
+                Key::Char('é'),
+            ]
+        );
     }
 
     #[test]

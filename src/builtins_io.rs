@@ -530,20 +530,22 @@ pub fn printf(sh: &mut Shell, args: &[String]) -> R {
 
 #[repr(C)]
 #[derive(Default)]
-#[allow(non_snake_case)]
-struct TimeZoneInfo {
-    Bias: i32,
-    StandardName: [u16; 32],
-    StandardDate: [u16; 8],
-    StandardBias: i32,
-    DaylightName: [u16; 32],
-    DaylightDate: [u16; 8],
-    DaylightBias: i32,
+struct Tm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+    tm_gmtoff: i64,
+    tm_zone: *const core::ffi::c_char,
 }
 
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetTimeZoneInformation(tz: *mut TimeZoneInfo) -> u32;
+extern "C" {
+    fn localtime_r(t: *const i64, tm: *mut Tm) -> *mut Tm;
 }
 
 pub fn now_epoch() -> i64 {
@@ -552,17 +554,17 @@ pub fn now_epoch() -> i64 {
 
 /// Local offset from UTC in seconds, and zone name.
 pub fn tz_offset() -> (i64, String) {
-    let mut tz = TimeZoneInfo::default();
-    let r = unsafe { GetTimeZoneInformation(&mut tz) };
-    let (bias, name) = if r == 2 {
-        (tz.Bias + tz.DaylightBias, &tz.DaylightName)
+    let now = now_epoch();
+    let mut tm = Tm::default();
+    if unsafe { localtime_r(&now, &mut tm) }.is_null() {
+        return (0, "UTC".into());
+    }
+    let name = if tm.tm_zone.is_null() {
+        String::new()
     } else {
-        (tz.Bias + tz.StandardBias, &tz.StandardName)
+        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }.to_string_lossy().into_owned()
     };
-    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-    let n = String::from_utf16_lossy(&name[..end]);
-    let abbr: String = n.split_whitespace().filter_map(|w| w.chars().next()).collect();
-    (-(bias as i64) * 60, if abbr.is_empty() { "UTC".into() } else { abbr })
+    (tm.tm_gmtoff, if name.is_empty() { "UTC".into() } else { name })
 }
 
 fn civil(days: i64) -> (i64, u32, u32) {
@@ -942,24 +944,22 @@ pub fn read(sh: &mut Shell, args: &[String]) -> R {
 }
 
 struct EchoOff {
-    mode: u32,
+    saved: Option<crate::sys::Termios>,
 }
 impl EchoOff {
     fn new() -> EchoOff {
-        let h = crate::sys::std_handle(crate::sys::STD_INPUT_HANDLE);
-        let mut m = 0;
-        unsafe {
-            crate::sys::GetConsoleMode(h, &mut m);
-            crate::sys::SetConsoleMode(h, m & !0x4);
+        let saved = crate::sys::get_termios(0);
+        if let Some(mut t) = saved {
+            crate::sys::no_echo_termios(&mut t);
+            crate::sys::set_termios(0, &t);
         }
-        EchoOff { mode: m }
+        EchoOff { saved }
     }
 }
 impl Drop for EchoOff {
     fn drop(&mut self) {
-        let h = crate::sys::std_handle(crate::sys::STD_INPUT_HANDLE);
-        unsafe {
-            crate::sys::SetConsoleMode(h, self.mode);
+        if let Some(t) = &self.saved {
+            crate::sys::set_termios(0, t);
         }
     }
 }
@@ -1057,77 +1057,54 @@ pub fn mapfile(sh: &mut Shell, name: &str, args: &[String]) -> R {
 
 // ---------------- test ----------------
 
-/// The file a test operator looks at. As with Cygwin, `foo` also names `foo.exe` when only that
-/// exists, so `[ -x /usr/bin/ls ]` and `[ -x "$(command -v git)" ]` find the programs.
-fn test_path(sh: &Shell, p: &str) -> std::path::PathBuf {
-    let w = path::to_win(p, &sh.cwd);
-    if !w.exists() && !p.ends_with('/') && !p.ends_with('\\') {
-        let mut e = w.clone().into_os_string();
-        e.push(".exe");
-        let e = std::path::PathBuf::from(e);
-        if e.is_file() {
-            return e;
-        }
-    }
-    w
-}
-
 fn file_meta(sh: &Shell, p: &str) -> Option<std::fs::Metadata> {
     if p.is_empty() {
         return None;
     }
-    let md = std::fs::metadata(test_path(sh, p)).ok()?;
-    if (p.ends_with('/') || p.ends_with('\\')) && !md.is_dir() {
+    let md = std::fs::metadata(path::resolve(p, &sh.cwd)).ok()?;
+    if p.ends_with('/') && !md.is_dir() {
         return None;
     }
     Some(md)
 }
 
-fn is_executable(p: &std::path::Path, md: &std::fs::Metadata) -> bool {
-    if md.is_dir() {
-        return true;
-    }
-    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if matches!(ext.as_str(), "exe" | "com" | "bat" | "cmd" | "sh" | "dll") {
-        return true;
-    }
-    use std::io::Read;
-    if let Ok(mut f) = std::fs::File::open(p) {
-        let mut b = [0u8; 2];
-        if f.read(&mut b).unwrap_or(0) == 2 {
-            return &b == b"#!" || &b == b"MZ";
-        }
-    }
-    false
+fn can_access(sh: &Shell, p: &str, mode: i32) -> bool {
+    !p.is_empty() && crate::sys::can_access(&path::resolve(p, &sh.cwd), mode)
+}
+
+fn mode_bit(sh: &Shell, p: &str, bit: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    file_meta(sh, p).map(|m| m.permissions().mode() & bit != 0).unwrap_or(false)
+}
+
+fn file_type_is(sh: &Shell, p: &str, is: fn(&std::fs::FileType) -> bool) -> bool {
+    file_meta(sh, p).map(|m| is(&m.file_type())).unwrap_or(false)
 }
 
 pub fn test_unary(sh: &mut Shell, op: &str, s: &str) -> bool {
-    let dev = |s: &str| matches!(s, "/dev/null" | "/dev/stdin" | "/dev/stdout" | "/dev/stderr" | "/dev/tty");
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     match op {
         "-z" => s.is_empty(),
         "-n" => !s.is_empty(),
-        "-e" | "-a" => dev(s) || file_meta(sh, s).is_some(),
+        "-e" | "-a" => file_meta(sh, s).is_some(),
         "-f" => file_meta(sh, s).map(|m| m.is_file()).unwrap_or(false),
         "-d" => file_meta(sh, s).map(|m| m.is_dir()).unwrap_or(false),
         "-s" => file_meta(sh, s).map(|m| m.len() > 0 || m.is_dir()).unwrap_or(false),
-        "-r" => dev(s) || file_meta(sh, s).is_some(),
-        "-w" => dev(s) || file_meta(sh, s).map(|m| !m.permissions().readonly() || m.is_dir()).unwrap_or(false),
-        "-x" => {
-            if s.is_empty() {
-                return false;
-            }
-            let p = test_path(sh, s);
-            match std::fs::metadata(&p) {
-                Ok(m) => is_executable(&p, &m),
-                Err(_) => false,
-            }
-        }
+        "-r" => can_access(sh, s, crate::sys::R_OK),
+        "-w" => can_access(sh, s, crate::sys::W_OK),
+        "-x" => can_access(sh, s, crate::sys::X_OK),
         "-L" | "-h" => {
-            !s.is_empty() && std::fs::symlink_metadata(path::to_win(s, &sh.cwd)).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+            !s.is_empty() && std::fs::symlink_metadata(path::resolve(s, &sh.cwd)).map(|m| m.file_type().is_symlink()).unwrap_or(false)
         }
-        "-c" => dev(s),
-        "-b" | "-p" | "-S" | "-g" | "-u" | "-k" => false,
-        "-O" | "-G" => file_meta(sh, s).is_some(),
+        "-c" => file_type_is(sh, s, FileTypeExt::is_char_device),
+        "-b" => file_type_is(sh, s, FileTypeExt::is_block_device),
+        "-p" => file_type_is(sh, s, FileTypeExt::is_fifo),
+        "-S" => file_type_is(sh, s, FileTypeExt::is_socket),
+        "-g" => mode_bit(sh, s, 0o2000),
+        "-u" => mode_bit(sh, s, 0o4000),
+        "-k" => mode_bit(sh, s, 0o1000),
+        "-O" => file_meta(sh, s).map(|m| m.uid() == crate::sys::effective_user_id()).unwrap_or(false),
+        "-G" => file_meta(sh, s).map(|m| m.gid() == crate::sys::effective_group_id()).unwrap_or(false),
         "-N" => file_meta(sh, s)
             .map(|m| match (m.modified(), m.accessed()) {
                 (Ok(a), Ok(b)) => a > b,
@@ -1210,8 +1187,8 @@ pub fn test_binary(sh: &mut Shell, a: &str, op: &str, b: &str, arith: bool) -> R
             _ => false,
         },
         "-ef" => {
-            let pa = std::fs::canonicalize(path::to_win(a, &sh.cwd));
-            let pb = std::fs::canonicalize(path::to_win(b, &sh.cwd));
+            let pa = std::fs::canonicalize(path::resolve(a, &sh.cwd));
+            let pb = std::fs::canonicalize(path::resolve(b, &sh.cwd));
             match (pa, pb) {
                 (Ok(x), Ok(y)) => x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
                 _ => false,

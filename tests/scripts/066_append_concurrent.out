@@ -1,4 +1,4 @@
 separate redirections: 30 lines, 30 distinct
 one redirection: 30 lines, 30 distinct
-builtins and MSYS programs: 40 lines, 40 distinct
+builtins and programs: 40 lines, 40 distinct
 new

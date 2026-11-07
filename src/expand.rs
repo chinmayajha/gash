@@ -419,7 +419,7 @@ impl Shell {
             c_locale: self.c_locale(),
         };
         let cwd = self.cwd.clone();
-        let mut v = pattern::glob(pat, opts, &|p| crate::path::to_win(p, &cwd));
+        let mut v = pattern::glob(pat, opts, &|p| crate::path::resolve(p, &cwd));
         if !ignore.is_empty() {
             let pats: Vec<Pattern> = ignore.split(':').filter(|s| !s.is_empty()).map(|s| Pattern::new_ext(s, false, opts.extglob)).collect();
             v.retain(|m| {
@@ -551,22 +551,10 @@ impl Shell {
 
     pub fn tilde(&mut self, user: &str) -> Option<String> {
         match user {
-            "" => Some(self.get_str("HOME").unwrap_or_else(|| crate::path::to_posix(&home_dir()))),
+            "" => Some(self.get_str("HOME").unwrap_or_else(|| crate::path::path_str(&home_dir()))),
             "+" => self.get_str("PWD"),
             "-" => self.get_str("OLDPWD"),
-            u => {
-                if u.eq_ignore_ascii_case(&crate::sys::user_name()) {
-                    return self.get_str("HOME");
-                }
-                let hd = home_dir();
-                let parent = hd.parent()?;
-                let p = parent.join(u);
-                if p.is_dir() {
-                    Some(crate::path::to_posix(&p))
-                } else {
-                    None
-                }
-            }
+            u => crate::sys::user_home(u),
         }
     }
 
@@ -1208,7 +1196,7 @@ impl Shell {
                     if sc.words.is_empty() && sc.assigns.is_empty() && sc.redirs.len() == 1 && sc.redirs[0].op == RedirOp::In && sc.redirs[0].fd.is_none() {
                         if let RedirTarget::Word(w) = &sc.redirs[0].target {
                             let p = self.expand_word_str(w)?;
-                            let wp = crate::path::to_win(&p, &self.cwd);
+                            let wp = crate::path::resolve(&p, &self.cwd);
                             return match std::fs::read(&wp) {
                                 Ok(b) => {
                                     self.status = 0;
@@ -1244,45 +1232,52 @@ impl Shell {
 
     fn proc_subst(&mut self, input: bool, prog: &Arc<Program>) -> Result<String, Flow> {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let m = crate::path::mounts();
-        let path = m.temp.join(format!("gash-ps-{}-{}", std::process::id(), n));
-        if input {
-            let f = match std::fs::File::create(&path) {
-                Ok(f) => f,
+        let path = loop {
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!("gash-ps-{}-{}", std::process::id(), n));
+            match crate::sys::make_fifo(&path) {
+                Ok(()) => break path,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
                     self.eprint(&format!("process substitution: {}", crate::exec::io_err_msg(&e)));
                     return Err(Flow::Abort(1));
                 }
-            };
-            let mut sub = self.subshell_clone();
-            sub.fds.set(1, Some(Handle::File(Arc::new(f))));
-            let r = sub.exec_list(&prog.items);
-            sub.finish_subshell(r);
-            drop(sub);
-            self.procsubst.push((path.clone(), None));
-        } else {
-            let _ = std::fs::File::create(&path);
-            self.procsubst.push((path.clone(), Some(prog.clone())));
-        }
-        Ok(crate::path::to_posix(&path))
+            }
+        };
+        let mut sub = self.subshell_clone();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        sub.cancel = cancel.clone();
+        sub.child_pid = child_pid.clone();
+        let (fifo, prog) = (path.clone(), prog.clone());
+        let thread = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let end = std::fs::OpenOptions::new().read(!input).write(input).open(&fifo);
+                let Ok(f) = end else {
+                    return 1;
+                };
+                sub.fds.set(if input { 1 } else { 0 }, Some(Handle::File(Arc::new(f))));
+                let r = sub.exec_list(&prog.items);
+                sub.finish_subshell(r)
+            })
+            .expect("spawn process substitution thread");
+        self.procsubst.push(ProcSubst { path: path.clone(), input, thread, cancel, child_pid });
+        Ok(crate::path::path_str(&path))
     }
 
     pub fn finish_procsubst(&mut self) {
-        if self.procsubst.is_empty() {
-            return;
-        }
-        let list = std::mem::take(&mut self.procsubst);
-        for (path, prog) in list {
-            if let Some(prog) = prog {
-                if let Ok(f) = std::fs::File::open(&path) {
-                    let mut sub = self.subshell_clone();
-                    sub.fds.set(0, Some(Handle::File(Arc::new(f))));
-                    let r = sub.exec_list(&prog.items);
-                    sub.finish_subshell(r);
+        for ps in std::mem::take(&mut self.procsubst) {
+            drop(std::fs::OpenOptions::new().read(true).write(true).open(&ps.path));
+            if ps.input {
+                ps.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                let pid = ps.child_pid.load(std::sync::atomic::Ordering::SeqCst);
+                if pid != 0 {
+                    crate::sys::kill_pid(pid as i32, crate::sys::SIGTERM);
                 }
             }
-            let _ = std::fs::remove_file(&path);
+            let _ = ps.thread.join();
+            let _ = std::fs::remove_file(&ps.path);
         }
     }
 }
@@ -1367,5 +1362,5 @@ pub fn attr_letters(a: u32, v: Option<&Value>) -> String {
 }
 
 pub fn home_dir() -> std::path::PathBuf {
-    std::env::var("USERPROFILE").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("C:\\"))
+    std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("/"))
 }

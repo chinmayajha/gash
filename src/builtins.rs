@@ -90,7 +90,7 @@ pub fn run(sh: &mut Shell, argv: &[String]) -> R {
         "caller" => caller(sh, args),
         "compgen" => compgen(sh, args),
         "complete" | "compopt" | "bind" => Ok(0),
-        "suspend" => usage_err(sh, name, "cannot suspend a shell on Windows"),
+        "suspend" => usage_err(sh, name, "cannot suspend a shell"),
         "fc" => usage_err(sh, name, "not supported"),
         "__git_ps1" => git_ps1(sh, args),
         _ => {
@@ -259,18 +259,16 @@ fn echo(sh: &mut Shell, args: &[String]) -> R {
 // ---------------- directories ----------------
 
 pub fn change_dir(sh: &mut Shell, target: &str, physical: bool) -> Result<(), String> {
-    let cur_pwd = sh.get_str("PWD").unwrap_or_else(|| path::to_posix(&sh.cwd));
-    let newpwd = if path::is_windows_abs(target) {
-        path::to_posix(&path::to_win(target, &sh.cwd))
-    } else if target.starts_with('/') {
+    let cur_pwd = sh.get_str("PWD").unwrap_or_else(|| path::path_str(&sh.cwd));
+    let newpwd = if target.starts_with('/') {
         path::normalize_posix(target)
     } else {
         path::normalize_posix(&format!("{}/{}", cur_pwd.trim_end_matches('/'), target))
     };
-    let mut win = path::to_win(&newpwd, &sh.cwd);
+    let mut win = path::resolve(&newpwd, &sh.cwd);
     if !win.is_dir() {
         // maybe logical path failed because of symlinks; try relative to physical cwd
-        let w2 = path::to_win(target, &sh.cwd);
+        let w2 = path::resolve(target, &sh.cwd);
         if w2.is_dir() && !target.starts_with('/') {
             win = w2;
         } else if win.exists() || w2.exists() {
@@ -288,14 +286,14 @@ pub fn change_dir(sh: &mut Shell, target: &str, physical: bool) -> Result<(), St
                 let s = c.to_string_lossy().into_owned();
                 let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
                 win = std::path::PathBuf::from(&s);
-                path::to_posix(&win)
+                path::path_str(&win)
             }
             Err(_) => newpwd.clone(),
         }
     } else {
-        path::to_posix(&path::to_win(&newpwd, &sh.cwd)).replace("//", "/")
+        path::path_str(&path::resolve(&newpwd, &sh.cwd)).replace("//", "/")
     };
-    let final_pwd = if newpwd.starts_with('/') && !physical && !path::is_windows_abs(target) { newpwd } else { final_pwd };
+    let final_pwd = if newpwd.starts_with('/') && !physical { newpwd } else { final_pwd };
     sh.cwd = win;
     let _ = sh.set_str("OLDPWD", &cur_pwd);
     let _ = sh.set_str("PWD", &final_pwd);
@@ -347,14 +345,14 @@ fn cd(sh: &mut Shell, args: &[String]) -> R {
         Some(t) => t.clone(),
     };
     // CDPATH
-    if !target.starts_with('/') && !target.starts_with('.') && !path::is_windows_abs(&target) {
+    if !target.starts_with('/') && !target.starts_with('.') {
         if let Some(cdpath) = sh.get_str("CDPATH") {
             for d in path::split_posix_list(&cdpath) {
                 if d.is_empty() {
                     continue;
                 }
                 let cand = format!("{}/{}", d.trim_end_matches('/'), target);
-                if path::to_win(&cand, &sh.cwd).is_dir() {
+                if path::resolve(&cand, &sh.cwd).is_dir() {
                     return match change_dir(sh, &cand, physical) {
                         Ok(()) => {
                             let p = sh.get_str_or_empty("PWD");
@@ -393,23 +391,15 @@ fn cd(sh: &mut Shell, args: &[String]) -> R {
 }
 
 pub fn physical_pwd(sh: &Shell) -> String {
-    path::to_posix(&physical_cwd(sh))
+    path::path_str(&physical_cwd(sh))
 }
 
-/// The current directory with symlinks resolved, as a Windows path.
+/// The current directory with symlinks resolved.
 fn physical_cwd(sh: &Shell) -> std::path::PathBuf {
-    match std::fs::canonicalize(&sh.cwd) {
-        Ok(c) => {
-            let s = c.to_string_lossy().into_owned();
-            std::path::PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
-        }
-        Err(_) => sh.cwd.clone(),
-    }
+    std::fs::canonicalize(&sh.cwd).unwrap_or_else(|_| sh.cwd.clone())
 }
 
 fn pwd(sh: &mut Shell, args: &[String]) -> R {
-    // -L, -P and MSYS bash's -W (the physical directory in Windows form, `C:/...`) each choose a
-    // form; as in Git Bash, the last one given wins.
     let mut form = if sh.o[O_PHYSICAL] { 'P' } else { 'L' };
     for a in args {
         if a == "--" || a == "-" || !a.starts_with('-') {
@@ -417,10 +407,10 @@ fn pwd(sh: &mut Shell, args: &[String]) -> R {
         }
         for c in a[1..].chars() {
             match c {
-                'L' | 'P' | 'W' => form = c,
+                'L' | 'P' => form = c,
                 _ => {
                     sh.eprint(&format!("pwd: -{}: invalid option", c));
-                    sh.eprint("pwd: usage: pwd [-LPW]");
+                    sh.eprint("pwd: usage: pwd [-LP]");
                     return Ok(2);
                 }
             }
@@ -428,10 +418,9 @@ fn pwd(sh: &mut Shell, args: &[String]) -> R {
     }
     let p = match form {
         'P' => physical_pwd(sh),
-        'W' => path::win_fwd(&physical_cwd(sh)),
         _ => match sh.get_str("PWD") {
-            Some(p) if !p.is_empty() && path::to_win(&p, &sh.cwd).is_dir() => p,
-            _ => path::to_posix(&sh.cwd),
+            Some(p) if !p.is_empty() && path::resolve(&p, &sh.cwd).is_dir() => p,
+            _ => path::path_str(&sh.cwd),
         },
     };
     sh.out(1, format!("{}\n", p).as_bytes())?;
@@ -654,13 +643,13 @@ fn find_source_file(sh: &mut Shell, f: &str) -> Option<std::path::PathBuf> {
             if d.is_empty() {
                 continue;
             }
-            let p = path::to_win(&format!("{}/{}", d, f), &sh.cwd);
+            let p = path::resolve(&format!("{}/{}", d, f), &sh.cwd);
             if p.is_file() {
                 return Some(p);
             }
         }
     }
-    let p = path::to_win(f, &sh.cwd);
+    let p = path::resolve(f, &sh.cwd);
     if p.is_file() {
         return Some(p);
     }
@@ -732,6 +721,7 @@ fn eval(sh: &mut Shell, args: &[String]) -> R {
 }
 
 fn exec(sh: &mut Shell, args: &[String]) -> R {
+    let mut replace = crate::shell::ExecReplace::default();
     let mut i = 0;
     while i < args.len() && args[i].starts_with('-') {
         match args[i].as_str() {
@@ -739,8 +729,15 @@ fn exec(sh: &mut Shell, args: &[String]) -> R {
                 i += 1;
                 break;
             }
-            "-a" => i += 2,
-            "-c" | "-l" | "-cl" | "-lc" => i += 1,
+            "-a" => {
+                replace.arg0 = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "-c" | "-cl" | "-lc" => {
+                replace.clear_env = true;
+                i += 1;
+            }
+            "-l" => i += 1,
             _ => break,
         }
     }
@@ -749,8 +746,10 @@ fn exec(sh: &mut Shell, args: &[String]) -> R {
         sh.keep_redirs = true;
         return Ok(0);
     }
-    let st = run_argv(sh, rest, false)?;
-    Err(Flow::Exit(st))
+    sh.replace_process = Some(replace);
+    let st = run_argv(sh, rest, false);
+    sh.replace_process = None;
+    Err(Flow::Exit(st?))
 }
 
 /// Run argv as a command (used by `command`, `exec`, `builtin`).
@@ -1113,12 +1112,7 @@ fn describe(sh: &mut Shell, name: &str, mode: char, all: bool, path_only: bool) 
             sh.hash.remove(name);
         }
         found = true;
-        let mut p = path::to_posix(&r.path);
-        // bash shows paths without .exe
-        let lower = p.to_lowercase();
-        if lower.ends_with(".exe") && !name.to_lowercase().ends_with(".exe") {
-            p.truncate(p.len() - 4);
-        }
+        let p = path::path_str(&r.path);
         match mode {
             't' => out.push_str("file\n"),
             'v' | 'p' => out.push_str(&format!("{}\n", p)),
@@ -1254,7 +1248,7 @@ fn hash(sh: &mut Shell, args: &[String]) -> R {
             return Ok(0);
         }
         let mut out = String::from("hits\tcommand\n");
-        let mut v: Vec<(String, String)> = sh.hash.iter().map(|(k, r)| (k.clone(), path::to_posix(&r.path))).collect();
+        let mut v: Vec<(String, String)> = sh.hash.iter().map(|(k, r)| (k.clone(), path::path_str(&r.path))).collect();
         v.sort();
         for (_, p) in v {
             out.push_str(&format!("   1\t{}\n", p));
@@ -1276,8 +1270,8 @@ fn hash(sh: &mut Shell, args: &[String]) -> R {
                 if i + 2 < args.len() + 1 && i + 2 <= args.len() - 1 {
                     let p = args[i + 1].clone();
                     let n = args[i + 2].clone();
-                    let wp = path::to_win(&p, &sh.cwd);
-                    if let Some(r) = sh.classify_file(&wp, false) {
+                    let wp = path::resolve(&p, &sh.cwd);
+                    if let Some(r) = sh.classify_file(&wp) {
                         sh.hash.insert(n, r);
                     }
                     return Ok(0);
@@ -1295,7 +1289,7 @@ fn hash(sh: &mut Shell, args: &[String]) -> R {
         if print_t {
             match sh.find_command(n) {
                 Some(r) => {
-                    let p = path::to_posix(&r.path);
+                    let p = path::path_str(&r.path);
                     sh.out(1, format!("{}\n", p).as_bytes())?;
                 }
                 None => {
@@ -1319,47 +1313,43 @@ fn hash(sh: &mut Shell, args: &[String]) -> R {
 // ---------------- traps ----------------
 
 pub fn norm_sig(s: &str) -> Option<String> {
-    let u = s.to_uppercase();
-    let u = u.strip_prefix("SIG").unwrap_or(&u).to_string();
-    let named = match u.as_str() {
-        "0" | "EXIT" => "EXIT",
-        "1" | "HUP" => "HUP",
-        "2" | "INT" => "INT",
-        "3" | "QUIT" => "QUIT",
-        "6" | "ABRT" => "ABRT",
-        "9" | "KILL" => "KILL",
-        "13" | "PIPE" => "PIPE",
-        "14" | "ALRM" => "ALRM",
-        "15" | "TERM" => "TERM",
-        "10" | "USR1" => "USR1",
-        "12" | "USR2" => "USR2",
-        "17" | "CHLD" => "CHLD",
-        "28" | "WINCH" => "WINCH",
-        "ERR" => "ERR",
-        "DEBUG" => "DEBUG",
-        "RETURN" => "RETURN",
-        _ => return None,
-    };
-    Some(named.to_string())
+    let upper = s.to_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    match name {
+        "0" | "EXIT" => return Some("EXIT".into()),
+        "ERR" | "DEBUG" | "RETURN" => return Some(name.into()),
+        _ => {}
+    }
+    if let Ok(n) = name.parse::<i32>() {
+        return crate::sys::signal_name(n).map(String::from);
+    }
+    crate::sys::signal_number(name).map(|_| name.to_string())
 }
 
 pub fn sig_num(s: &str) -> Option<i32> {
-    Some(match norm_sig(s)?.as_str() {
-        "EXIT" => 0,
-        "HUP" => 1,
-        "INT" => 2,
-        "QUIT" => 3,
-        "ABRT" => 6,
-        "KILL" => 9,
-        "USR1" => 10,
-        "USR2" => 12,
-        "PIPE" => 13,
-        "ALRM" => 14,
-        "TERM" => 15,
-        "CHLD" => 17,
-        "WINCH" => 28,
-        _ => return None,
-    })
+    match norm_sig(s)?.as_str() {
+        "EXIT" => Some(0),
+        name => crate::sys::signal_number(name),
+    }
+}
+
+fn signal_table() -> String {
+    let mut out = String::new();
+    for (i, (name, num)) in crate::sys::SIGNALS.iter().enumerate() {
+        out.push_str(&format!("{:2}) SIG{}", num, name));
+        out.push(if (i + 1) % 5 == 0 { '\n' } else { '\t' });
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn parse_signal(spec: &str) -> Option<i32> {
+    match spec.parse::<i32>() {
+        Ok(n) => (0..=64).contains(&n).then_some(n),
+        Err(_) => sig_num(spec),
+    }
 }
 
 fn trap(sh: &mut Shell, args: &[String]) -> R {
@@ -1381,7 +1371,7 @@ fn trap(sh: &mut Shell, args: &[String]) -> R {
         return Ok(0);
     }
     if args[0] == "-l" {
-        sh.out(1, b" 1) SIGHUP\t 2) SIGINT\t 3) SIGQUIT\t 6) SIGABRT\t 9) SIGKILL\n10) SIGUSR1\t12) SIGUSR2\t13) SIGPIPE\t14) SIGALRM\t15) SIGTERM\n")?;
+        sh.out(1, signal_table().as_bytes())?;
         return Ok(0);
     }
     let (action, sigs): (Option<String>, &[String]) = if args.len() == 1 || (args[0].parse::<u32>().is_ok() && norm_sig(&args[0]).is_some()) {
@@ -1430,6 +1420,29 @@ fn find_job(sh: &mut Shell, spec: &str) -> Option<usize> {
     sh.jobs.list.iter().position(|j| j.pid == pid)
 }
 
+enum Waited {
+    Done(i32),
+    Signal(i32),
+}
+
+fn wait_index(sh: &mut Shell, i: usize) -> Result<Waited, Flow> {
+    loop {
+        if let Some(st) = sh.jobs.list[i].poll() {
+            sh.jobs.list.remove(i);
+            return Ok(Waited::Done(st));
+        }
+        if crate::sys::interrupted() {
+            return Err(Flow::Fatal(130));
+        }
+        let pending = crate::sys::first_pending();
+        sh.check_int()?;
+        if let Some(sig) = pending {
+            return Ok(Waited::Signal(128 + sig));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 fn wait(sh: &mut Shell, args: &[String]) -> R {
     let mut next = false;
     let mut specs = Vec::new();
@@ -1456,35 +1469,35 @@ fn wait(sh: &mut Shell, args: &[String]) -> R {
         }
     }
     if specs.is_empty() {
-        let mut st = 0;
+        for mut c in std::mem::take(&mut sh.jobs.disowned) {
+            sh.check_int()?;
+            let _ = c.wait();
+        }
         while !sh.jobs.list.is_empty() {
-            let mut j = sh.jobs.list.remove(0);
-            loop {
-                if let Some(s) = j.poll() {
-                    st = s;
-                    break;
-                }
-                if crate::sys::interrupted() {
-                    sh.jobs.list.insert(0, j);
-                    return Err(Flow::Fatal(130));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(2));
+            if let Waited::Signal(code) = wait_index(sh, 0)? {
+                return Ok(code);
             }
         }
-        let _ = st;
         return Ok(0);
     }
     let mut st = 0;
     for s in specs {
         match find_job(sh, &s) {
             Some(i) => {
-                let mut j = sh.jobs.list.remove(i);
-                st = j.wait();
+                match wait_index(sh, i)? {
+                    Waited::Done(code) => st = code,
+                    Waited::Signal(code) => return Ok(code),
+                }
             }
             None => {
                 if let Ok(pid) = s.parse::<u32>() {
-                    if crate::sys::pid_alive(pid) {
-                        while crate::sys::pid_alive(pid) {
+                    if let Some(code) = sh.jobs.wait_disowned(pid) {
+                        st = code;
+                        continue;
+                    }
+                    if crate::sys::pid_alive(pid as i32) {
+                        while crate::sys::pid_alive(pid as i32) {
+                            sh.check_int()?;
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                         st = 0;
@@ -1545,12 +1558,15 @@ fn fg(sh: &mut Shell, args: &[String]) -> R {
 
 fn disown(sh: &mut Shell, args: &[String]) -> R {
     if args.is_empty() || args.iter().any(|a| a == "-a") {
-        sh.jobs.list.clear();
+        for j in std::mem::take(&mut sh.jobs.list) {
+            sh.jobs.disown(j);
+        }
         return Ok(0);
     }
-    for a in args {
+    for a in args.iter().filter(|a| !a.starts_with('-')) {
         if let Some(i) = find_job(sh, a) {
-            sh.jobs.list.remove(i);
+            let j = sh.jobs.list.remove(i);
+            sh.jobs.disown(j);
         }
     }
     Ok(0)
@@ -1560,30 +1576,52 @@ fn kill(sh: &mut Shell, args: &[String]) -> R {
     let mut sig = 15;
     let mut i = 0;
     if args.first().map(|a| a == "-l" || a == "-L").unwrap_or(false) {
-        if let Some(n) = args.get(1) {
-            if let Ok(num) = n.parse::<i32>() {
-                let num = if num > 128 { num - 128 } else { num };
-                for s in ["HUP", "INT", "QUIT", "ABRT", "KILL", "USR1", "USR2", "PIPE", "ALRM", "TERM"] {
-                    if sig_num(s) == Some(num) {
-                        sh.out(1, format!("{}\n", s).as_bytes())?;
+        let Some(spec) = args.get(1) else {
+            sh.out(1, signal_table().as_bytes())?;
+            return Ok(0);
+        };
+        let mut st = 0;
+        for spec in &args[1..] {
+            match spec.parse::<i32>() {
+                Ok(n) => {
+                    let n = if n > 128 { n - 128 } else { n };
+                    match crate::sys::signal_name(n) {
+                        Some(name) => sh.out(1, format!("{}\n", name).as_bytes())?,
+                        None => {
+                            sh.eprint(&format!("kill: {}: invalid signal specification", spec));
+                            st = 1;
+                        }
                     }
                 }
-                return Ok(0);
+                Err(_) => match sig_num(spec) {
+                    Some(n) => sh.out(1, format!("{}\n", n).as_bytes())?,
+                    None => {
+                        sh.eprint(&format!("kill: {}: invalid signal specification", spec));
+                        st = 1;
+                    }
+                },
             }
         }
-        sh.out(1, b"HUP INT QUIT ABRT KILL USR1 USR2 PIPE ALRM TERM\n")?;
-        return Ok(0);
+        let _ = spec;
+        return Ok(st);
     }
     while i < args.len() && args[i].starts_with('-') && args[i].len() > 1 {
         let a = &args[i];
-        if a == "-s" || a == "-n" {
+        let spec = if a == "-s" || a == "-n" {
             i += 1;
-            sig = args.get(i).and_then(|s| sig_num(s).or_else(|| s.parse().ok())).unwrap_or(15);
+            args.get(i).map(String::as_str).unwrap_or("")
         } else if a == "--" {
             i += 1;
             break;
         } else {
-            sig = sig_num(&a[1..]).or_else(|| a[1..].parse().ok()).unwrap_or(15);
+            &a[1..]
+        };
+        match parse_signal(spec) {
+            Some(n) => sig = n,
+            None => {
+                sh.eprint(&format!("kill: {}: invalid signal specification", spec));
+                return Ok(1);
+            }
         }
         i += 1;
     }
@@ -1595,21 +1633,17 @@ fn kill(sh: &mut Shell, args: &[String]) -> R {
             }
             continue;
         }
-        match t.parse::<u32>() {
-            Ok(pid) if pid == sh.bashpid || pid == sh.pid => {
+        match t.parse::<i32>() {
+            Ok(pid) if pid > 0 && (pid as u32 == sh.bashpid || pid as u32 == sh.pid) => {
                 if sig == 0 {
                     continue;
                 }
-                let name = ["HUP", "INT", "QUIT", "ABRT", "KILL", "USR1", "USR2", "PIPE", "ALRM", "TERM", "CHLD", "WINCH"]
-                    .iter()
-                    .find(|n| sig_num(n) == Some(sig))
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                match sh.traps.get(&name).cloned() {
+                let name = crate::sys::signal_name(sig).unwrap_or_default();
+                match sh.traps.get(name).cloned() {
                     Some(a) if a.is_empty() => {}
-                    Some(_) => sh.run_trap(&name)?,
+                    Some(_) => sh.run_trap(name)?,
                     None => {
-                        if name != "CHLD" && name != "WINCH" {
+                        if sig != crate::sys::SIGCHLD && sig != crate::sys::SIGWINCH {
                             return Err(Flow::Exit(128 + sig));
                         }
                     }
@@ -1620,7 +1654,7 @@ fn kill(sh: &mut Shell, args: &[String]) -> R {
                     if !crate::sys::pid_alive(pid) {
                         st = 1;
                     }
-                } else if !crate::sys::kill_pid(pid, 128 + sig as u32) {
+                } else if !crate::sys::kill_pid(pid, sig) {
                     sh.eprint(&format!("kill: ({}) - No such process", pid));
                     st = 1;
                 }
@@ -1640,24 +1674,22 @@ fn umask(sh: &mut Shell, args: &[String]) -> R {
     let sym = args.iter().any(|a| a == "-S");
     let val = args.iter().find(|a| !a.starts_with('-'));
     match val {
-        Some(v) => {
-            if let Ok(m) = u32::from_str_radix(v, 8) {
-                sh.umask = m;
+        Some(v) => match u32::from_str_radix(v, 8) {
+            Ok(m) if m <= 0o777 => sh.umask = m,
+            _ => {
+                sh.eprint(&format!("umask: {}: octal number out of range", v));
+                return Ok(1);
             }
-        }
+        },
         None => {
             if sym {
                 let m = !sh.umask & 0o777;
                 let f = |b: u32| {
                     let mut s = String::new();
-                    if b & 4 != 0 {
-                        s.push('r')
-                    }
-                    if b & 2 != 0 {
-                        s.push('w')
-                    }
-                    if b & 1 != 0 {
-                        s.push('x')
+                    for (bit, c) in [(4, 'r'), (2, 'w'), (1, 'x')] {
+                        if b & bit != 0 {
+                            s.push(c);
+                        }
                     }
                     s
                 };
@@ -1677,15 +1709,87 @@ fn times(sh: &mut Shell) -> R {
     Ok(0)
 }
 
+const LIMITS: &[(char, i32, u64, &str, &str)] = &[
+    ('c', crate::sys::RLIMIT_CORE, 512, "core file size", "blocks"),
+    ('d', crate::sys::RLIMIT_DATA, 1024, "data seg size", "kbytes"),
+    ('f', crate::sys::RLIMIT_FSIZE, 512, "file size", "blocks"),
+    ('l', crate::sys::RLIMIT_MEMLOCK, 1024, "max locked memory", "kbytes"),
+    ('m', crate::sys::RLIMIT_RSS, 1024, "max memory size", "kbytes"),
+    ('n', crate::sys::RLIMIT_NOFILE, 1, "open files", ""),
+    ('s', crate::sys::RLIMIT_STACK, 1024, "stack size", "kbytes"),
+    ('t', crate::sys::RLIMIT_CPU, 1, "cpu time", "seconds"),
+    ('u', crate::sys::RLIMIT_NPROC, 1, "max user processes", ""),
+    ('v', crate::sys::RLIMIT_RSS, 1024, "virtual memory", "kbytes"),
+];
+
 fn ulimit(sh: &mut Shell, args: &[String]) -> R {
-    if args.iter().all(|a| a.starts_with('-')) {
-        if args.iter().any(|a| a.contains('a')) {
-            sh.out(1, b"core file size              (blocks, -c) unlimited\nfile size                   (blocks, -f) unlimited\nopen files                          (-n) unlimited\nstack size                  (kbytes, -s) unlimited\n")?;
-        } else if args.iter().any(|a| a.contains('n')) {
-            sh.out(1, b"3200\n")?;
-        } else {
-            sh.out(1, b"unlimited\n")?;
+    let (mut soft, mut hard, mut all) = (false, false, false);
+    let mut letter = None;
+    let mut value = None;
+    for a in args {
+        match a.strip_prefix('-') {
+            Some(flags) if !flags.is_empty() => {
+                for c in flags.chars() {
+                    match c {
+                        'S' => soft = true,
+                        'H' => hard = true,
+                        'a' => all = true,
+                        c if LIMITS.iter().any(|l| l.0 == c) => letter = Some(c),
+                        _ => {
+                            sh.eprint(&format!("ulimit: -{}: invalid option", c));
+                            return Ok(2);
+                        }
+                    }
+                }
+            }
+            _ => value = Some(a.clone()),
         }
+    }
+    let show = |res: i32, scale: u64| -> String {
+        match crate::sys::get_rlimit(res) {
+            Some((s, h)) => {
+                let v = if hard && !soft { h } else { s };
+                if v == crate::sys::RLIM_INFINITY {
+                    "unlimited".into()
+                } else {
+                    (v / scale).to_string()
+                }
+            }
+            None => "unlimited".into(),
+        }
+    };
+    if all {
+        let mut out = String::new();
+        for (c, res, scale, label, unit) in LIMITS.iter().filter(|l| l.0 != 'v' || true) {
+            let paren = if unit.is_empty() { format!("(-{})", c) } else { format!("({}, -{})", unit, c) };
+            out.push_str(&format!("{:<w$}{} {}\n", label, paren, show(*res, *scale), w = 36 - paren.len()));
+        }
+        sh.out(1, out.as_bytes())?;
+        return Ok(0);
+    }
+    let (_, res, scale, label, _) = *LIMITS.iter().find(|l| l.0 == letter.unwrap_or('f')).unwrap();
+    let Some(v) = value else {
+        sh.out(1, format!("{}\n", show(res, scale)).as_bytes())?;
+        return Ok(0);
+    };
+    let new = if v == "unlimited" {
+        crate::sys::RLIM_INFINITY
+    } else {
+        match v.parse::<u64>() {
+            Ok(n) => n.saturating_mul(scale),
+            Err(_) => {
+                sh.eprint(&format!("ulimit: {}: invalid number", v));
+                return Ok(1);
+            }
+        }
+    };
+    let (cur_soft, cur_hard) = crate::sys::get_rlimit(res).unwrap_or((new, new));
+    let both = !soft && !hard;
+    let new_soft = if soft || both { new } else { cur_soft };
+    let new_hard = if hard || both { new } else { cur_hard };
+    if !crate::sys::set_rlimit(res, new_soft, new_hard) {
+        sh.eprint(&format!("ulimit: {}: cannot modify limit: Operation not permitted", label));
+        return Ok(1);
     }
     Ok(0)
 }
@@ -1715,7 +1819,7 @@ fn enable(sh: &mut Shell, args: &[String]) -> R {
 }
 
 fn help(sh: &mut Shell, _args: &[String]) -> R {
-    let mut out = format!("gash {} - a fast native bash-compatible shell for Windows\nBuiltins:\n", env!("CARGO_PKG_VERSION"));
+    let mut out = format!("gash {} - a fast native bash-compatible shell for macOS\nBuiltins:\n", env!("CARGO_PKG_VERSION"));
     for chunk in BUILTINS.chunks(8) {
         out.push_str("  ");
         out.push_str(&chunk.join(" "));
@@ -1844,8 +1948,8 @@ pub fn git_branch(sh: &Shell) -> Option<String> {
                 let s = std::fs::read_to_string(&g).ok()?;
                 let p = s.trim().strip_prefix("gitdir:")?.trim().to_string();
                 let pp = std::path::PathBuf::from(&p);
-                if pp.is_absolute() || path::is_windows_abs(&p) {
-                    path::to_win(&p, &dir)
+                if pp.is_absolute() {
+                    pp
                 } else {
                     dir.join(pp)
                 }

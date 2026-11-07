@@ -1,0 +1,28 @@
+rc=0 [hi|] /bin/echo hi >> f
+rc=0 [Hi|] echo hi | /usr/bin/sed s/h/H/ >> f
+rc=0 [bbc|] /usr/bin/sed s/a/b/ <<< abc >> f
+rc=0 [1|] /usr/bin/grep -c . <<< x >> f
+rc=0 [1|] /usr/bin/awk 'BEGIN{print 1}' >> f
+rc=0 [z|] /usr/bin/sort <<< z >> f
+rc=0 [z|] /bin/cat <<< z >> f
+rc=0 [x|] { /bin/echo x; } >> f
+rc=0 [x|] ( /bin/echo x ) >> f
+rc=1 [ls: /nonexistent: No such file or directory|] /bin/ls /nonexistent 2>> f
+rc=0 [O1|E1|O2|] /bin/sh -c "echo O1; echo E1 >&2; echo O2" >> f 2>&1
+rc=0 [O1|E1|O2|] /bin/sh -c "echo O1; echo E1 >&2; echo O2" &>> f
+rc=0 [b|] git -c alias.z="!sed s/a/b/ in.txt" z >> f
+rc=0 [awk-script|] ./s.awk >> f
+start
+a
+b
+c
+d
+e
+f
+pipe-1
+ls: /nonexistent: No such file or directory
+pipe-2
+builtin-1
+prog-fg
+bg-late
+builtin-2
